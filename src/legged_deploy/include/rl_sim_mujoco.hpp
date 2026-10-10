@@ -17,6 +17,8 @@
 #include "fsm_go2.hpp"
 #include "fsm_bpx.hpp"
 #include <mutex>
+#include <thread>
+#include <chrono>
 
 #include <csignal>
 #include <vector>
@@ -74,8 +76,20 @@ private:
     void RunModel();
     void RobotControl();
 
-    // BPX serializes its controller/model/input state. Go2 retains its existing scheduling.
-    std::mutex bpx_state_mutex_;
+    // BPX: one owner for input, FSM, inference and PD, under sim->mtx.
+    // No BPX wall-clock control/model/input loops may run concurrently.
+    std::thread bpx_physics_thread_;
+    bool bpx_ready_ = false;
+    bool bpx_skip_next_step_ = false;
+    bool bpx_faulted_ = false;
+    int bpx_policy_phase_ = 0;
+    double bpx_last_step_time_ = 0.0;
+    std::chrono::steady_clock::time_point bpx_keyboard_poll_{};
+    std::chrono::steady_clock::time_point bpx_joystick_poll_{};
+    bool BpxPhysicsStep(mjModel* model, mjData* data, bool advance);
+    void ServiceBpxInputs();
+    void ClearBpxInput();
+    void StopBpxPhysics();
     void PollKeyboard();
     void ValidateBpxModel();
     void ResetBpxSimulation(bool reset_fsm);
@@ -95,8 +109,8 @@ private:
     void Plot();
 
     // mujoco
-    mjData *mj_data;
-    mjModel *mj_model;
+    mjData *mj_data = nullptr;
+    mjModel *mj_model = nullptr;
     std::string scene_name;
 
     // joystick

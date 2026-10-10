@@ -12,6 +12,7 @@
 
 // 用于处理 POSIX 系统信号 (如 SIGINT/Ctrl+C) 的静态实例，确保资源能释放
 RL_Sim* RL_Sim::instance = nullptr;
+namespace { volatile std::sig_atomic_t simulation_exit_requested = 0; }
 
 /**
  * @brief 构造 RL_Sim 仿真环境，初始化 MuJoCo 上下文，并派生多线程任务。
@@ -83,10 +84,29 @@ RL_Sim* RL_Sim::instance = nullptr;
 
     std::string filename = std::string(CMAKE_CURRENT_SOURCE_DIR) + "/../robot_description/" + this->robot_name + "_description/mjcf/" + this->scene_name + ".xml";
 
-    // start physics thread
-    // 启动物理线程
-    std::thread physicsthreadhandle(&PhysicsThread, sim.get(), filename.c_str());
-    physicsthreadhandle.detach();
+    if (!std::filesystem::is_regular_file(filename))
+        throw std::runtime_error("MuJoCo scene not found: " + filename);
+
+    // BPX joins its physics thread before destroying the callback owner.
+    // The filename string is copied into the thread, never borrowed from ctor scope.
+    if (this->robot_name == "bpx")
+    {
+        this->bpx_physics_thread_ = std::thread([this, filename]() {
+            PhysicsThread(sim.get(), filename.c_str(),
+                [this](mjModel* model, mjData* data, bool advance) {
+                    return this->BpxPhysicsStep(model, data, advance);
+                });
+        });
+    }
+    else
+    {
+        std::thread([this, filename]() {
+            PhysicsThread(sim.get(), filename.c_str(), PhysicsStepHook{});
+        }).detach();
+    }
+
+    try
+    {
     
     // 轮询自旋锁：阻塞主线程，等待物理线程初始化 mj_data 数据结构
     while (1)
@@ -109,7 +129,10 @@ RL_Sim* RL_Sim::instance = nullptr;
             std::cout << LOGGER::INFO << "[MuJoCo] Data prepared" << std::endl;
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (simulation_exit_requested) sim->exitrequest.store(1);
+        if (sim->exitrequest.load())
+            throw std::runtime_error("MuJoCo load canceled or failed");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     if (this->robot_name != "bpx")
@@ -149,6 +172,8 @@ RL_Sim* RL_Sim::instance = nullptr;
         const std::lock_guard<std::recursive_mutex> lock(sim->mtx);
         this->ValidateBpxModel();
         this->ResetBpxSimulation(false);
+        this->simulation_running = (sim->run != 0);
+        this->bpx_ready_ = true;
     }
 
     // loop 
@@ -156,20 +181,25 @@ RL_Sim* RL_Sim::instance = nullptr;
     *  控制循环 loop_control：负责读取机器人状态、执行状态机控制、发送关节命令等核心控制逻辑，周期由 YAML 配置中的 "dt" 参数定义
     *  强化学习循环 loop_rl：负责调用 RL 模型进行推理，生成动作指令，周期为控制循环的整数倍（由 "decimation" 参数定义），以实现更高效的 RL 推理频率
     */
-    this->loop_control = std::make_shared<LoopFunc>("loop_control", this->params.Get<float>("dt"), std::bind(&RL_Sim::RobotControl, this));
-    this->loop_rl = std::make_shared<LoopFunc>("loop_rl", this->params.Get<float>("dt") * this->params.Get<int>("decimation"), std::bind(&RL_Sim::RunModel, this));
-    this->loop_control->start();
-    this->loop_rl->start();
-
-    // keyboard
-    this->loop_keyboard = std::make_shared<LoopFunc>("loop_keyboard", 0.05, std::bind(&RL_Sim::PollKeyboard, this));
-    this->loop_keyboard->start();
-
-    // joystick
-    this->loop_joystick = std::make_shared<LoopFunc>("loop_joystick", 0.01, std::bind(&RL_Sim::GetSysJoystick, this));
-    this->loop_joystick->start();
+    if (this->robot_name != "bpx")
+    {
+        this->loop_control = std::make_shared<LoopFunc>("loop_control", this->params.Get<float>("dt"), std::bind(&RL_Sim::RobotControl, this));
+        this->loop_rl = std::make_shared<LoopFunc>("loop_rl", this->params.Get<float>("dt") * this->params.Get<int>("decimation"), std::bind(&RL_Sim::RunModel, this));
+        this->loop_control->start();
+        this->loop_rl->start();
+    
+        // keyboard
+        this->loop_keyboard = std::make_shared<LoopFunc>("loop_keyboard", 0.05, std::bind(&RL_Sim::PollKeyboard, this));
+        this->loop_keyboard->start();
+    
+        // joystick
+        this->loop_joystick = std::make_shared<LoopFunc>("loop_joystick", 0.01, std::bind(&RL_Sim::GetSysJoystick, this));
+        this->loop_joystick->start();
+    }
 
 #ifdef PLOT
+    if (this->robot_name == "bpx")
+        throw std::runtime_error("BPX physics-owned control requires PLOT disabled");
     this->plot_t = std::vector<int>(this->plot_size, 0);
     this->plot_real_joint_pos.resize(this->params.Get<int>("num_of_dofs"));
     this->plot_target_joint_pos.resize(this->params.Get<int>("num_of_dofs"));
@@ -186,21 +216,57 @@ RL_Sim* RL_Sim::instance = nullptr;
 
     // start simulation UI loop (blocking call)
     sim->RenderLoop();
+    this->StopBpxPhysics();
+    }
+    catch (...)
+    {
+        this->StopBpxPhysics();
+        instance = nullptr;
+        throw;
+    }
 }
 
 RL_Sim::~RL_Sim()
 {
-    // Clear static instance pointer
+    this->StopBpxPhysics();
     instance = nullptr;
-
-    this->loop_keyboard->shutdown();
-    this->loop_joystick->shutdown();
-    this->loop_control->shutdown();
-    this->loop_rl->shutdown();
+    if (loop_keyboard) loop_keyboard->shutdown();
+    if (loop_joystick) loop_joystick->shutdown();
+    if (loop_control) loop_control->shutdown();
+    if (loop_rl) loop_rl->shutdown();
 #ifdef PLOT
-    this->loop_plot->shutdown();
+    if (loop_plot) loop_plot->shutdown();
 #endif
     std::cout << LOGGER::INFO << "RL_Sim exit" << std::endl;
+}
+
+void RL_Sim::StopBpxPhysics()
+{
+    if (!this->bpx_physics_thread_.joinable()) return;
+    sim->exitrequest.store(1);
+    {
+        const std::lock_guard<std::recursive_mutex> lock(sim->mtx);
+        this->bpx_ready_ = false;
+        sim->cond_loadrequest.notify_all();
+    }
+    // Never join while holding sim->mtx: the physics thread may need it to exit.
+    this->bpx_physics_thread_.join();
+    {
+        const std::lock_guard<std::recursive_mutex> lock(sim->mtx);
+        // RenderLoop has returned (or never started). BPX worker deliberately
+        // leaves its last model/data alive until the viewer and hook are done.
+        sim->m_ = nullptr;
+        sim->d_ = nullptr;
+        sim->mnew_ = nullptr;
+        sim->dnew_ = nullptr;
+        sim->loadrequest = 0;
+        mj_deleteData(d);
+        mj_deleteModel(m);
+        d = nullptr;
+        m = nullptr;
+    }
+    this->mj_model = nullptr;
+    this->mj_data = nullptr;
 }
 
 /**
@@ -228,6 +294,15 @@ void RL_Sim::GetState(RobotState<float> *state)
             * state->motor_state.dq[i]：关节速度
             * state->motor_state.tau_est[i]：关节力矩估计
             */
+            if (this->robot_name == "bpx")
+            {
+                const int motor = this->params.Get<std::vector<int>>("joint_mapping")[i];
+                const int joint = mj_model->actuator_trnid[2 * motor];
+                state->motor_state.q[i] = mj_data->qpos[mj_model->jnt_qposadr[joint]];
+                state->motor_state.dq[i] = mj_data->qvel[mj_model->jnt_dofadr[joint]];
+                state->motor_state.tau_est[i] = mj_data->sensordata[motor + 24];
+                continue;
+            }
             state->motor_state.q[i] = mj_data->sensordata[this->params.Get<std::vector<int>>("joint_mapping")[i]];
             state->motor_state.dq[i] = mj_data->sensordata[this->params.Get<std::vector<int>>("joint_mapping")[i] + this->params.Get<int>("num_of_dofs")];
             state->motor_state.tau_est[i] = mj_data->sensordata[this->params.Get<std::vector<int>>("joint_mapping")[i] + 2 * this->params.Get<int>("num_of_dofs")];
@@ -245,6 +320,21 @@ void RL_Sim::SetCommand(const RobotCommand<float> *command)
     {
         for (int i = 0; i < this->params.Get<int>("num_of_dofs"); ++i)
         {
+            if (this->robot_name == "bpx")
+            {
+                const int motor = this->params.Get<std::vector<int>>("joint_mapping")[i];
+                const int joint = mj_model->actuator_trnid[2 * motor];
+                const double q = mj_data->qpos[mj_model->jnt_qposadr[joint]];
+                const double dq = mj_data->qvel[mj_model->jnt_dofadr[joint]];
+                const double tau = command->motor_command.tau[i] +
+                    command->motor_command.kp[i] * (command->motor_command.q[i] - q) +
+                    command->motor_command.kd[i] * (command->motor_command.dq[i] - dq);
+                if (!std::isfinite(tau)) throw std::runtime_error("BPX nonfinite PD torque");
+                mj_data->ctrl[motor] = std::clamp(tau,
+                    mj_model->actuator_ctrlrange[2 * motor],
+                    mj_model->actuator_ctrlrange[2 * motor + 1]);
+                continue;
+            }
             // 核心执行逻辑：混合前馈力矩与反馈误差校正
             mj_data->ctrl[this->params.Get<std::vector<int>>("joint_mapping")[i]] =
                 command->motor_command.tau[i] +
@@ -261,70 +351,40 @@ void RL_Sim::SetCommand(const RobotCommand<float> *command)
  */
 void RL_Sim::RobotControl()
 {
-    std::unique_lock<std::mutex> bpx_lock(this->bpx_state_mutex_, std::defer_lock);
-    if (this->robot_name == "bpx") bpx_lock.lock();
-    // Lock the sim mutex once for the entire control cycle to prevent race conditions
+    if (simulation_exit_requested)
+    {
+        sim->exitrequest.store(1);
+        return;
+    }
     const std::lock_guard<std::recursive_mutex> lock(sim->mtx);
-
     this->GetState(&this->robot_state);
-
-    const bool bpx_passive_requested = this->robot_name == "bpx" &&
-        bpx_fsm::WantsPassive(*this);
-    if (bpx_passive_requested)
-    {
-        if (this->fsm.current_state_ &&
-            this->fsm.current_state_->GetStateName() == "RLFSMStatePassive")
-        {
-            this->fsm.next_state_ = this->fsm.current_state_;
-            this->fsm.mode_ = FSM::Mode::NORMAL;
-        }
-        else this->fsm.RequestStateChange("RLFSMStatePassive");
-    }
     this->StateController(&this->robot_state, &this->robot_command);
-    if (this->robot_name == "bpx") this->ClampBpxCommands();
-    if (bpx_passive_requested)
-    {
-        bpx_fsm::StopPolicyAndDrain(*this);
-        this->InitControl();
-        bpx_fsm::Damping(*this, &this->robot_state, &this->robot_command);
-    }
-
-    if (this->control.current_keyboard == Input::Keyboard::R || this->control.current_gamepad == Input::Gamepad::RB_Y)
-    {
-        if (this->mj_model && this->mj_data)
-        {
-            if (this->robot_name == "bpx") this->ResetBpxSimulation(true);
-            else
-            {
-                mj_resetData(this->mj_model, this->mj_data);
-                mj_forward(this->mj_model, this->mj_data);
-            }
-        }
-    }
-
-    // 处理仿真启停逻辑 (接管物理引擎的时间流逝)
-    if (this->control.current_keyboard == Input::Keyboard::Enter || this->control.current_gamepad == Input::Gamepad::RB_X)
-    {
-        if (simulation_running)
-        {
-            sim->run = 0;
-            std::cout << std::endl << LOGGER::INFO << "Simulation Stop" << std::endl;
-        }
-        else
-        {
-            sim->run = 1;
-            std::cout << std::endl << LOGGER::INFO << "Simulation Start" << std::endl;
-        }
-        simulation_running = !simulation_running;
-    }
 
     if (this->robot_name == "bpx")
     {
-        this->control.current_keyboard = this->control.last_keyboard = Input::Keyboard::None;
-        this->control.current_gamepad = this->control.last_gamepad = Input::Gamepad::None;
+        // Called exactly once per physical step; critical input was handled first.
+        this->ClampBpxCommands();
+        this->ClearBpxInput();
+        return; // BpxPhysicsStep applies PD after possible same-step inference.
     }
-    else this->control.ClearInput();
 
+    // Preserve the Go2 controller and wall-clock loop path.
+    if (control.current_keyboard == Input::Keyboard::R || control.current_gamepad == Input::Gamepad::RB_Y)
+    {
+        if (mj_model && mj_data)
+        {
+            mj_resetData(mj_model, mj_data);
+            mj_forward(mj_model, mj_data);
+        }
+    }
+    if (control.current_keyboard == Input::Keyboard::Enter || control.current_gamepad == Input::Gamepad::RB_X)
+    {
+        sim->run = simulation_running ? 0 : 1;
+        simulation_running = !simulation_running;
+        std::cout << std::endl << LOGGER::INFO
+                  << (simulation_running ? "Simulation Start" : "Simulation Stop") << std::endl;
+    }
+    this->control.ClearInput();
     this->SetCommand(&this->robot_command);
 }
 
@@ -348,8 +408,6 @@ void RL_Sim::SetupSysJoystick(const std::string& device, int bits)
  */
 void RL_Sim::GetSysJoystick()
 {
-    std::unique_lock<std::mutex> bpx_lock(this->bpx_state_mutex_, std::defer_lock);
-    if (this->robot_name == "bpx") bpx_lock.lock();
     // Clear all button event states
     // 重置瞬态按键事件位图，防止粘键
     for (int i = 0; i < 20; ++i)
@@ -450,8 +508,6 @@ void RL_Sim::GetSysJoystick()
  */
 void RL_Sim::RunModel()
 {
-    std::unique_lock<std::mutex> bpx_lock(this->bpx_state_mutex_, std::defer_lock);
-    if (this->robot_name == "bpx") bpx_lock.lock();
     try
     {
         if (this->rl_init_done && simulation_running)
@@ -586,13 +642,8 @@ void RL_Sim::Plot()
 
 void RL_Sim::PollKeyboard()
 {
-    std::unique_lock<std::mutex> bpx_lock(this->bpx_state_mutex_, std::defer_lock);
-    if (this->robot_name == "bpx")
-    {
-        bpx_lock.lock();
-        // The existing keyboard poll is nonblocking only on a foreground TTY.
-        if (!::isatty(STDIN_FILENO) || ::tcgetpgrp(STDIN_FILENO) != ::getpgrp()) return;
-    }
+    if (this->robot_name == "bpx" &&
+        (!::isatty(STDIN_FILENO) || ::tcgetpgrp(STDIN_FILENO) != ::getpgrp())) return;
     this->KeyboardInterface();
 }
 
@@ -655,11 +706,13 @@ void RL_Sim::ValidateBpxModel()
         throw std::runtime_error("BPX requires MuJoCo control clamping");
     if (mj_name2id(this->mj_model, mjOBJ_KEY, "home") < 0)
         throw std::runtime_error("BPX requires a home keyframe");
+    // Report numerical failures instead of silently returning to qpos0.
+    this->mj_model->opt.disableflags |= mjDSBL_AUTORESET;
 }
 
 void RL_Sim::ResetBpxSimulation(bool reset_fsm)
 {
-    // Caller holds sim->mtx; runtime callers also hold bpx_state_mutex_.
+    // Only the BPX physics owner calls this after startup; caller holds sim->mtx.
     const int home = mj_name2id(this->mj_model, mjOBJ_KEY, "home");
     if (home < 0) throw std::runtime_error("BPX missing home keyframe");
     bpx_fsm::StopPolicyAndDrain(*this);
@@ -669,6 +722,9 @@ void RL_Sim::ResetBpxSimulation(bool reset_fsm)
     this->InitControl();
     this->obs.actions.assign(12, 0.0f);
     this->episode_length_buf = 0;
+    this->bpx_policy_phase_ = 0;
+    this->bpx_last_step_time_ = this->mj_data->time;
+    this->bpx_faulted_ = false;
     this->control.current_keyboard = this->control.last_keyboard = Input::Keyboard::None;
     this->control.current_gamepad = this->control.last_gamepad = Input::Gamepad::None;
     if (reset_fsm)
@@ -680,21 +736,197 @@ void RL_Sim::ResetBpxSimulation(bool reset_fsm)
         this->fsm.mode_ = FSM::Mode::NORMAL;
     }
     bpx_fsm::Damping(*this, &this->robot_state, &this->robot_command);
+    this->SetCommand(&this->robot_command);
+}
+
+
+void RL_Sim::ClearBpxInput()
+{
+    control.current_keyboard = control.last_keyboard = Input::Keyboard::None;
+    control.current_gamepad = control.last_gamepad = Input::Gamepad::None;
+}
+
+void RL_Sim::ServiceBpxInputs()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now - bpx_keyboard_poll_ >= std::chrono::milliseconds(50))
+    {
+        PollKeyboard();
+        bpx_keyboard_poll_ = now;
+    }
+    if (now - bpx_joystick_poll_ >= std::chrono::milliseconds(10))
+    {
+        GetSysJoystick();
+        bpx_joystick_poll_ = now;
+    }
+    simulation_running = (sim->run != 0); // GUI pause is also authoritative.
+    GetState(&robot_state);
+
+    // Passive cancels a queued GetUp/RL transition, including while paused.
+    if (bpx_fsm::WantsPassive(*this))
+    {
+        bpx_fsm::StopPolicyAndDrain(*this);
+        const auto previous = fsm.current_state_;
+        if (previous && previous->GetStateName() != "RLFSMStatePassive") previous->Exit();
+        fsm.previous_state_ = previous;
+        fsm.SetInitialState("RLFSMStatePassive");
+        fsm.mode_ = FSM::Mode::NORMAL;
+        InitControl();
+        bpx_fsm::Damping(*this, &robot_state, &robot_command);
+        bpx_policy_phase_ = 0;
+        ClearBpxInput();
+        return;
+    }
+    if (control.current_keyboard == Input::Keyboard::R || control.current_gamepad == Input::Gamepad::RB_Y)
+    {
+        ValidateBpxModel();
+        ResetBpxSimulation(true);
+        bpx_skip_next_step_ = true; // A reset is not a physical/control tick.
+        return;
+    }
+    if (control.current_keyboard == Input::Keyboard::Enter || control.current_gamepad == Input::Gamepad::RB_X)
+    {
+        sim->run = !sim->run;
+        simulation_running = (sim->run != 0);
+        sim->speed_changed = true;
+        ClearBpxInput();
+        std::cout << std::endl << LOGGER::INFO
+                  << (simulation_running ? "Simulation Start" : "Simulation Stop") << std::endl;
+    }
+    if (!sim->run)
+    {
+        // Paused 0/A prepares the transition; Enter later starts its trajectory.
+        // Do not call FSM::Run(), GetUp::Enter() or inference while paused.
+        if (fsm.current_state_ && fsm.current_state_->GetStateName() == "RLFSMStatePassive" &&
+            (control.current_keyboard == Input::Keyboard::Num0 || control.current_gamepad == Input::Gamepad::A))
+            fsm.RequestStateChange("RLFSMStateGetUp");
+        ClearBpxInput();
+    }
+}
+
+bool RL_Sim::BpxPhysicsStep(mjModel* model, mjData* data, bool advance)
+{
+    // PhysicsLoop holds sim->mtx. No independent BPX callbacks may touch RL state.
+    if (simulation_exit_requested) sim->exitrequest.store(1);
+    if (!bpx_ready_ || sim->exitrequest.load()) return false;
+    try
+    {
+        if (mj_model != model || mj_data != data)
+        {
+            // The viewer loaded another model/data allocation. Never use old pointers.
+            mj_model = model;
+            mj_data = data;
+            ValidateBpxModel();
+            ResetBpxSimulation(true);
+            bpx_skip_next_step_ = true;
+        }
+        // A rejected reload must never reach BPX sensor/mapping reads on later calls.
+        // R can recover a control fault on a valid model; invalid models require reload.
+        if (bpx_faulted_) ValidateBpxModel();
+        if (data->time < bpx_last_step_time_)
+        {
+            ResetBpxSimulation(true);
+            bpx_skip_next_step_ = true;
+        }
+        ServiceBpxInputs(); // Also services P/R/Enter during paused outer iterations.
+        if (!advance) return false;
+        if (bpx_skip_next_step_)
+        {
+            bpx_skip_next_step_ = false;
+            return false;
+        }
+        if (bpx_faulted_) sim->run = 0;
+        simulation_running = (sim->run != 0);
+        if (!simulation_running) return false;
+
+        // Update current IMU/derived quantities before taking this step's observation.
+        // FSM/actor are not installed as mjcb_control, so forward cannot tick them.
+        mj_forward(model, data);
+        GetState(&robot_state);
+        RobotControl(); // Exactly one FSM/trajectory tick per physical step.
+
+        const auto policy_active = [this]() {
+            return rl_init_done && fsm.mode_ == FSM::Mode::NORMAL && fsm.current_state_ &&
+                   fsm.current_state_->GetStateName() == "RLFSMStateRLLocomotion";
+        };
+        if (policy_active())
+        {
+            if (bpx_policy_phase_ == 0)
+            {
+                RunModel();
+                if (policy_active())
+                {
+                    // Consume the newly inferred target in THIS physical step.
+                    // Calling FSM::Run() again here would double-tick the state machine.
+                    auto state = std::dynamic_pointer_cast<RLFSMState>(fsm.current_state_);
+                    if (!state) throw std::runtime_error("BPX policy state type mismatch");
+                    state->RLControl();
+                }
+            }
+        }
+        else
+        {
+            bpx_fsm::StopPolicyAndDrain(*this);
+            bpx_policy_phase_ = 0;
+        }
+
+        // Hold the position target for four steps, but recompute PD EVERY step.
+        SetCommand(&robot_command);
+        sim->InjectNoise();
+        for (int motor = 0; motor < model->nu; ++motor)
+        {
+            if (!std::isfinite(data->ctrl[motor]))
+                throw std::runtime_error("BPX nonfinite motor control");
+            data->ctrl[motor] = std::clamp(data->ctrl[motor],
+                model->actuator_ctrlrange[2 * motor], model->actuator_ctrlrange[2 * motor + 1]);
+        }
+        const double before = data->time;
+        mj_step(model, data); // The only normal-running BPX integration site.
+        for (mjtWarning warning : {mjWARN_BADQPOS, mjWARN_BADQVEL, mjWARN_BADQACC})
+            if (data->warning[warning].number > 0)
+                throw std::runtime_error(mju_warningText(warning, data->warning[warning].lastinfo));
+        if (data->time <= before)
+            throw std::runtime_error("BPX physics reset unexpectedly; inspect numerical warnings");
+        bpx_last_step_time_ = data->time;
+        bpx_policy_phase_ = policy_active() ?
+            (bpx_policy_phase_ + 1) % params.Get<int>("decimation") : 0;
+        return true;
+    }
+    catch (const std::exception& error)
+    {
+        sim->run = 0;
+        simulation_running = false;
+        sim->speed_changed = true;
+        const bool first_fault = !bpx_faulted_;
+        bpx_faulted_ = true;
+        bpx_policy_phase_ = 0;
+        bpx_fsm::StopPolicyAndDrain(*this);
+        if (data) mju_zero(data->ctrl, model->nu);
+        if (first_fault)
+            std::cerr << LOGGER::ERROR << "[BPX] Simulation paused: " << error.what()
+                      << "; fix the input/model, then use terminal R." << std::endl;
+        return false;
+    }
 }
 
 // Signal handler for Ctrl+C
-void signalHandler(int signum)
+void signalHandler(int)
 {
-    std::cout << LOGGER::INFO << "Received signal " << signum << ", exiting..." << std::endl;
-    if (RL_Sim::instance && RL_Sim::instance->sim)
-    {
-        RL_Sim::instance->sim->exitrequest.store(1);
-    }
+    simulation_exit_requested = 1;
 }
 
 int main(int argc, char **argv)
 {
     signal(SIGINT, signalHandler);
-    RL_Sim rl_sar(argc, argv);
-    return 0;
+    try
+    {
+        RL_Sim rl_sar(argc, argv);
+        return 0;
+    }
+    catch (const std::exception& error)
+    {
+        RL_Sim::instance = nullptr;
+        std::cerr << LOGGER::ERROR << error.what() << std::endl;
+        return 1;
+    }
 }

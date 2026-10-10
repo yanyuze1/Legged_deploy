@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,13 @@
 #include "array_safety.h"
 
 #define MUJOCO_PLUGIN_DIR "mujoco_plugin"
+
+// Empty hook preserves the original simulator path. A BPX hook owns its complete
+// feedback/control/step sequence: false services inputs without advancing time;
+// true refreshes feedback and may perform exactly one mj_step. Its return value
+// reports whether that physical step was performed. Callbacks run with sim.mtx
+// held and must not acquire a lock whose owner could be waiting for sim.mtx.
+using PhysicsStepHook = std::function<bool(mjModel*, mjData*, bool)>;
 
 extern "C" {
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -268,8 +276,39 @@ mjModel* LoadModel(const char* file, mj::Simulate& sim) {
   return mnew;
 }
 
+// BPX-only counterpart of Simulate::Load. The original Load waits only for a
+// render-thread acknowledgement and cannot be cancelled before RenderLoop starts.
+// The caller retains ownership when this returns false; pending viewer pointers
+// are cleared under sim.mtx before the caller may destroy those allocations.
+bool LoadWithCancellation(mj::Simulate& sim, mjModel* model, mjData* data,
+                          const char* displayed_filename) {
+  std::unique_lock<std::recursive_mutex> lock(sim.mtx);
+  if (sim.exitrequest.load()) return false;
+
+  sim.mnew_ = model;
+  sim.dnew_ = data;
+  mju::strcpy_arr(sim.filename, displayed_filename);
+  sim.loadrequest = 2;
+  while (sim.loadrequest != 0 && !sim.exitrequest.load()) {
+    // A UI/signal exit can set the atomic flag before the owner gets to notify.
+    // Timed waits also cover that notification-free cancellation boundary.
+    sim.cond_loadrequest.wait_for(lock, std::chrono::milliseconds(10));
+  }
+
+  // A render-thread acknowledgement may race the exit request. Adopted objects
+  // remain alive and are committed to m/d; their final release belongs to the
+  // BPX owner after RenderLoop has returned and its physics worker has joined.
+  if (sim.m_ == model && sim.d_ == data) return true;
+
+  if (sim.mnew_ == model) sim.mnew_ = nullptr;
+  if (sim.dnew_ == data) sim.dnew_ = nullptr;
+  sim.loadrequest = 0;
+  sim.cond_loadrequest.notify_all();
+  return false;
+}
+
 // simulate in background thread (while rendering in main thread)
-void PhysicsLoop(mj::Simulate& sim) {
+void PhysicsLoop(mj::Simulate& sim, const PhysicsStepHook& step_hook = {}) {
   // cpu-sim syncronization point
   std::chrono::time_point<mj::Simulate::Clock> syncCPU;
   mjtNum syncSim = 0;
@@ -284,7 +323,15 @@ void PhysicsLoop(mj::Simulate& sim) {
       mjData* dnew = nullptr;
       if (mnew) dnew = mj_makeData(mnew);
       if (dnew) {
-        sim.Load(mnew, dnew, sim.dropfilename);
+        if (step_hook) {
+          if (!LoadWithCancellation(sim, mnew, dnew, sim.dropfilename)) {
+            mj_deleteData(dnew);
+            mj_deleteModel(mnew);
+            break;
+          }
+        } else {
+          sim.Load(mnew, dnew, sim.dropfilename);
+        }
 
         // lock the sim mutex
         const std::unique_lock<std::recursive_mutex> lock(sim.mtx);
@@ -297,6 +344,7 @@ void PhysicsLoop(mj::Simulate& sim) {
         mj_forward(m, d);
 
       } else {
+        if (step_hook && mnew) mj_deleteModel(mnew);
         sim.LoadMessageClear();
       }
     }
@@ -308,7 +356,15 @@ void PhysicsLoop(mj::Simulate& sim) {
       mjData* dnew = nullptr;
       if (mnew) dnew = mj_makeData(mnew);
       if (dnew) {
-        sim.Load(mnew, dnew, sim.filename);
+        if (step_hook) {
+          if (!LoadWithCancellation(sim, mnew, dnew, sim.filename)) {
+            mj_deleteData(dnew);
+            mj_deleteModel(mnew);
+            break;
+          }
+        } else {
+          sim.Load(mnew, dnew, sim.filename);
+        }
 
         // lock the sim mutex
         const std::unique_lock<std::recursive_mutex> lock(sim.mtx);
@@ -321,13 +377,22 @@ void PhysicsLoop(mj::Simulate& sim) {
         mj_forward(m, d);
 
       } else {
+        if (step_hook && mnew) mj_deleteModel(mnew);
         sim.LoadMessageClear();
       }
     }
 
     // sleep for 1 ms or yield, to let main thread run
     //  yield results in busy wait - which has better timing but kills battery life
-    if (sim.run && sim.busywait) {
+    bool use_busywait;
+    if (step_hook) {
+      // BPX observes the UI's plain run/busywait fields under their common lock.
+      const std::unique_lock<std::recursive_mutex> lock(sim.mtx);
+      use_busywait = sim.run && sim.busywait;
+    } else {
+      use_busywait = sim.run && sim.busywait;
+    }
+    if (use_busywait) {
       std::this_thread::yield();
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -339,6 +404,11 @@ void PhysicsLoop(mj::Simulate& sim) {
 
       // run only if model is present
       if (m) {
+        // Service terminal/controller requests even while paused. This call must
+        // not advance the FSM trajectory, actor phase, or physical simulation.
+        if (step_hook) step_hook(m, d, false);
+        if (step_hook && sim.exitrequest.load()) break;
+
         // running
         if (sim.run) {
           bool stepped = false;
@@ -366,13 +436,20 @@ void PhysicsLoop(mj::Simulate& sim) {
             sim.speed_changed = false;
 
             // run single step, let next iteration deal with timing
-            mj_step(m, d);
-            const char* message = Diverged(m->opt.disableflags, d);
-            if (message) {
-              sim.run = 0;
-              mju::strcpy_arr(sim.load_error, message);
+            const bool advanced = step_hook ? step_hook(m, d, true) :
+                (mj_step(m, d), true);
+            if (!advanced) {
+              // Pause/reset/input housekeeping may cancel this step. Resync the
+              // next attempt and do not record a canceled step as history.
+              sim.speed_changed = true;
             } else {
-              stepped = true;
+              const char* message = Diverged(m->opt.disableflags, d);
+              if (message) {
+                sim.run = 0;
+                mju::strcpy_arr(sim.load_error, message);
+              } else {
+                stepped = true;
+              }
             }
           }
 
@@ -385,7 +462,8 @@ void PhysicsLoop(mj::Simulate& sim) {
 
             // step while sim lags behind cpu and within refreshTime
             while (Seconds((d->time - syncSim)*slowdown) < mj::Simulate::Clock::now() - syncCPU &&
-                   mj::Simulate::Clock::now() - startCPU < Seconds(refreshTime)) {
+                   mj::Simulate::Clock::now() - startCPU < Seconds(refreshTime) &&
+                   (!step_hook || (sim.run && !sim.exitrequest.load()))) {
               // measure slowdown before first step
               if (!measured && elapsedSim) {
                 sim.measured_slowdown =
@@ -394,14 +472,26 @@ void PhysicsLoop(mj::Simulate& sim) {
               }
 
               // inject noise
-              sim.InjectNoise();
+              // A BPX hook injects noise after updating PD, just before its step.
+              // The empty-hook path retains the original simulator timing.
+              if (!step_hook) sim.InjectNoise();
 
               // call mj_step
-              mj_step(m, d);
+              const bool advanced = step_hook ? step_hook(m, d, true) :
+                  (mj_step(m, d), true);
+              if (!advanced) {
+                sim.speed_changed = true;
+                stepped = false;
+                break;
+              }
               const char* message = Diverged(m->opt.disableflags, d);
               if (message) {
                 sim.run = 0;
                 mju::strcpy_arr(sim.load_error, message);
+                if (step_hook) {
+                  stepped = false;
+                  break;
+                }
               } else {
                 stepped = true;
               }
@@ -433,7 +523,8 @@ void PhysicsLoop(mj::Simulate& sim) {
 
 //-------------------------------------- physics_thread --------------------------------------------
 
-void PhysicsThread(mj::Simulate* sim, const char* filename) {
+void PhysicsThread(mj::Simulate* sim, const char* filename,
+                   PhysicsStepHook step_hook = {}) {
   // request loadmodel if file given (otherwise drag-and-drop)
   if (filename != nullptr) {
     sim->LoadMessage(filename);
@@ -445,7 +536,11 @@ void PhysicsThread(mj::Simulate* sim, const char* filename) {
       d = mj_makeData(m);
     }
     if (d) {
-      sim->Load(m, d, filename);
+      if (step_hook) {
+        if (!LoadWithCancellation(*sim, m, d, filename)) return;
+      } else {
+        sim->Load(m, d, filename);
+      }
 
       // lock the sim mutex
       const std::unique_lock<std::recursive_mutex> lock(sim->mtx);
@@ -453,15 +548,33 @@ void PhysicsThread(mj::Simulate* sim, const char* filename) {
       mj_forward(m, d);
 
     } else {
+      if (step_hook) {
+        const std::unique_lock<std::recursive_mutex> lock(sim->mtx);
+        if (m) mj_deleteModel(m);
+        m = nullptr;
+        d = nullptr;
+        sim->exitrequest.store(1);
+      }
       sim->LoadMessageClear();
     }
   }
 
-  PhysicsLoop(*sim);
+  if (step_hook && (!m || !d)) {
+    sim->exitrequest.store(1);
+    sim->LoadMessageClear();
+    return;
+  }
 
-  // delete everything we allocated
-  mj_deleteData(d);
-  mj_deleteModel(m);
+  PhysicsLoop(*sim, step_hook);
+
+  // The Go2 path retains its original ownership. For BPX, RenderLoop may still
+  // be rendering when exitrequest becomes 1: the RL_Sim owner must first return
+  // from RenderLoop, cancel pending loads, and join this worker, then clear the
+  // viewer pointers and delete m/d. Deleting here would race the renderer.
+  if (!step_hook) {
+    mj_deleteData(d);
+    mj_deleteModel(m);
+  }
 }
 
 //------------------------------------------ main --------------------------------------------------
