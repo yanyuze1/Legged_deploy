@@ -15,6 +15,8 @@
 #include "inference_runtime.hpp"
 #include "loop.hpp"
 #include "fsm_go2.hpp"
+#include "fsm_bpx.hpp"
+#include <mutex>
 
 #include <csignal>
 #include <vector>
@@ -71,6 +73,13 @@ private:
     void SetCommand(const RobotCommand<float> *command) override;
     void RunModel();
     void RobotControl();
+
+    // BPX serializes its controller/model/input state. Go2 retains its existing scheduling.
+    std::mutex bpx_state_mutex_;
+    void PollKeyboard();
+    void ValidateBpxModel();
+    void ResetBpxSimulation(bool reset_fsm);
+    void ClampBpxCommands();
 
     // loop
     std::shared_ptr<LoopFunc> loop_keyboard;

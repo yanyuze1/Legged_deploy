@@ -1,0 +1,18 @@
+bpx:
+  dt: 0.005
+  decimation: 4
+  num_of_dofs: 12
+  wheel_indices: []
+  fixed_kp: [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
+  fixed_kd: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+  passive_kd: 1.0
+  getup_duration: 2.0
+  getdown_duration: 1.0
+  command_limits: [1.5, 1.0, 2.0]
+  torque_limits: [30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0]
+  # Policy order: roll FL/FR/HL/HR, pitch FL/FR/HL/HR, knee FL/FR/HL/HR.
+  default_dof_pos: [0.0, 0.0, 0.0, 0.0, 0.8, 0.8, 0.8, 0.8, -1.5, -1.5, -1.5, -1.5]
+  joint_names: [fl_hip_roll_joint, fr_hip_roll_joint, hl_hip_roll_joint, hr_hip_roll_joint,
+                fl_hip_pitch_joint, fr_hip_pitch_joint, hl_hip_pitch_joint, hr_hip_pitch_joint,
+                fl_knee_joint, fr_knee_joint, hl_knee_joint, hr_knee_joint]
+  joint_mapping: [0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]

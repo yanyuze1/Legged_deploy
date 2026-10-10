@@ -84,6 +84,11 @@ void RL::StateController(const RobotState<float>* state, RobotCommand<float>* co
 std::vector<float> RL::ComputeObservation()
 {
     std::vector<std::vector<float>> obs_list;
+    const bool clip_before_scale = this->params.Get<bool>("clip_observations_before_scale", false);
+    const float observation_limit = this->params.Get<float>("clip_obs");
+    const auto raw_term = [&](const std::vector<float>& values) {
+        return clip_before_scale ? clamp(values, -observation_limit, observation_limit) : values;
+    };
 
     // 依照 YAML 中定义的顺序，动态拼装观测向量。顺序必须与训练时环境导出的一致！
     for (const std::string &observation : this->params.Get<std::vector<std::string>>("observations"))
@@ -91,7 +96,7 @@ std::vector<float> RL::ComputeObservation()
         // ============= Base Observations 基础运动学观测 =============
         if (observation == "lin_vel")
         {
-            obs_list.push_back(this->obs.lin_vel * this->params.Get<float>("lin_vel_scale"));
+            obs_list.push_back(raw_term(this->obs.lin_vel) * this->params.Get<float>("lin_vel_scale"));
         }
         else if (observation == "ang_vel")
         {
@@ -99,21 +104,21 @@ std::vector<float> RL::ComputeObservation()
             // In ROS2 Gazebo, mujoco and real robot, the coordinate system for angular velocity is in the body coordinate system.
             if (this->ang_vel_axis == "body")
             {
-                obs_list.push_back(this->obs.ang_vel * this->params.Get<float>("ang_vel_scale"));
+                obs_list.push_back(raw_term(this->obs.ang_vel) * this->params.Get<float>("ang_vel_scale"));
             }
             else if (this->ang_vel_axis == "world")
             {
-                obs_list.push_back(QuatRotateInverse(this->obs.base_quat, this->obs.ang_vel) * this->params.Get<float>("ang_vel_scale"));
+                obs_list.push_back(raw_term(QuatRotateInverse(this->obs.base_quat, this->obs.ang_vel)) * this->params.Get<float>("ang_vel_scale"));
             }
         }
         else if (observation == "gravity_vec")
         {
             // 将绝对坐标系下的 [0, 0, -1] 投影到当前机体姿态系，用以感知地平线倾角
-            obs_list.push_back(QuatRotateInverse(this->obs.base_quat, this->obs.gravity_vec));
+            obs_list.push_back(raw_term(QuatRotateInverse(this->obs.base_quat, this->obs.gravity_vec)));
         }
         else if (observation == "commands")
         {
-            obs_list.push_back(this->obs.commands * this->params.Get<std::vector<float>>("commands_scale"));
+            obs_list.push_back(raw_term(this->obs.commands) * this->params.Get<std::vector<float>>("commands_scale"));
         }
         else if (observation == "dof_pos")
         {   
@@ -124,15 +129,15 @@ std::vector<float> RL::ComputeObservation()
             {
                 dof_pos_rel[i] = 0.0f;
             }
-            obs_list.push_back(dof_pos_rel * this->params.Get<float>("dof_pos_scale"));
+            obs_list.push_back(raw_term(dof_pos_rel) * this->params.Get<float>("dof_pos_scale"));
         }
         else if (observation == "dof_vel")
         {
-            obs_list.push_back(this->obs.dof_vel * this->params.Get<float>("dof_vel_scale"));
+            obs_list.push_back(raw_term(this->obs.dof_vel) * this->params.Get<float>("dof_vel_scale"));
         }
         else if (observation == "actions")
         {
-            obs_list.push_back(this->obs.actions);
+            obs_list.push_back(raw_term(this->obs.actions));
         }
         // ============= Other Observations =============
         else if (observation == "whole_body_tracking/motion_command")
@@ -202,7 +207,7 @@ std::vector<float> RL::ComputeObservation()
     {
         obs.insert(obs.end(), obs_vec.begin(), obs_vec.end());
     }
-    std::vector<float> clamped_obs = clamp(obs, -this->params.Get<float>("clip_obs"), this->params.Get<float>("clip_obs"));
+    std::vector<float> clamped_obs = clip_before_scale ? obs : clamp(obs, -observation_limit, observation_limit);
     return clamped_obs;
 }
 

@@ -34,9 +34,9 @@ RL_Sim* RL_Sim::instance = nullptr;
         this->scene_name = argv[2];
     }
 
-    if (this->robot_name != "go2")
+    if (this->robot_name != "go2" && this->robot_name != "bpx")
     {
-        throw std::runtime_error("This deployment supports robot_name=go2 only");
+        throw std::runtime_error("Supported robot names: go2, bpx");
     }
 
     this->ang_vel_axis = "body";
@@ -91,7 +91,20 @@ RL_Sim* RL_Sim::instance = nullptr;
     // 轮询自旋锁：阻塞主线程，等待物理线程初始化 mj_data 数据结构
     while (1)
     {
-        if (d)
+        bool data_prepared = false;
+        if (this->robot_name == "bpx")
+        {
+            // PhysicsThread publishes m/d while holding the same sim mutex.
+            const std::lock_guard<std::recursive_mutex> lock(sim->mtx);
+            if (d)
+            {
+                this->mj_model = m;
+                this->mj_data = d;
+                data_prepared = true;
+            }
+        }
+        else data_prepared = (d != nullptr);
+        if (data_prepared)
         {
             std::cout << LOGGER::INFO << "[MuJoCo] Data prepared" << std::endl;
             break;
@@ -99,8 +112,11 @@ RL_Sim* RL_Sim::instance = nullptr;
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    this->mj_model = m;
-    this->mj_data = d;
+    if (this->robot_name != "bpx")
+    {
+        this->mj_model = m;
+        this->mj_data = d;
+    }
 
     // 初始化外设操作摇杆，绑定使用js0设备，16位精度，推荐将摇杆设备抽取至 YAML 配置中解耦
     this->SetupSysJoystick("/dev/input/js0", 16); // 16 bits joystick
@@ -128,6 +144,13 @@ RL_Sim* RL_Sim::instance = nullptr;
     this->InitOutputs();
     this->InitControl();
 
+    if (this->robot_name == "bpx")
+    {
+        const std::lock_guard<std::recursive_mutex> lock(sim->mtx);
+        this->ValidateBpxModel();
+        this->ResetBpxSimulation(false);
+    }
+
     // loop 
     /*
     *  控制循环 loop_control：负责读取机器人状态、执行状态机控制、发送关节命令等核心控制逻辑，周期由 YAML 配置中的 "dt" 参数定义
@@ -139,7 +162,7 @@ RL_Sim* RL_Sim::instance = nullptr;
     this->loop_rl->start();
 
     // keyboard
-    this->loop_keyboard = std::make_shared<LoopFunc>("loop_keyboard", 0.05, std::bind(&RL_Sim::KeyboardInterface, this));
+    this->loop_keyboard = std::make_shared<LoopFunc>("loop_keyboard", 0.05, std::bind(&RL_Sim::PollKeyboard, this));
     this->loop_keyboard->start();
 
     // joystick
@@ -238,19 +261,44 @@ void RL_Sim::SetCommand(const RobotCommand<float> *command)
  */
 void RL_Sim::RobotControl()
 {
+    std::unique_lock<std::mutex> bpx_lock(this->bpx_state_mutex_, std::defer_lock);
+    if (this->robot_name == "bpx") bpx_lock.lock();
     // Lock the sim mutex once for the entire control cycle to prevent race conditions
     const std::lock_guard<std::recursive_mutex> lock(sim->mtx);
 
     this->GetState(&this->robot_state);
 
+    const bool bpx_passive_requested = this->robot_name == "bpx" &&
+        bpx_fsm::WantsPassive(*this);
+    if (bpx_passive_requested)
+    {
+        if (this->fsm.current_state_ &&
+            this->fsm.current_state_->GetStateName() == "RLFSMStatePassive")
+        {
+            this->fsm.next_state_ = this->fsm.current_state_;
+            this->fsm.mode_ = FSM::Mode::NORMAL;
+        }
+        else this->fsm.RequestStateChange("RLFSMStatePassive");
+    }
     this->StateController(&this->robot_state, &this->robot_command);
+    if (this->robot_name == "bpx") this->ClampBpxCommands();
+    if (bpx_passive_requested)
+    {
+        bpx_fsm::StopPolicyAndDrain(*this);
+        this->InitControl();
+        bpx_fsm::Damping(*this, &this->robot_state, &this->robot_command);
+    }
 
     if (this->control.current_keyboard == Input::Keyboard::R || this->control.current_gamepad == Input::Gamepad::RB_Y)
     {
         if (this->mj_model && this->mj_data)
         {
-            mj_resetData(this->mj_model, this->mj_data);
-            mj_forward(this->mj_model, this->mj_data);
+            if (this->robot_name == "bpx") this->ResetBpxSimulation(true);
+            else
+            {
+                mj_resetData(this->mj_model, this->mj_data);
+                mj_forward(this->mj_model, this->mj_data);
+            }
         }
     }
 
@@ -270,7 +318,12 @@ void RL_Sim::RobotControl()
         simulation_running = !simulation_running;
     }
 
-    this->control.ClearInput();
+    if (this->robot_name == "bpx")
+    {
+        this->control.current_keyboard = this->control.last_keyboard = Input::Keyboard::None;
+        this->control.current_gamepad = this->control.last_gamepad = Input::Gamepad::None;
+    }
+    else this->control.ClearInput();
 
     this->SetCommand(&this->robot_command);
 }
@@ -295,6 +348,8 @@ void RL_Sim::SetupSysJoystick(const std::string& device, int bits)
  */
 void RL_Sim::GetSysJoystick()
 {
+    std::unique_lock<std::mutex> bpx_lock(this->bpx_state_mutex_, std::defer_lock);
+    if (this->robot_name == "bpx") bpx_lock.lock();
     // Clear all button event states
     // 重置瞬态按键事件位图，防止粘键
     for (int i = 0; i < 20; ++i)
@@ -363,6 +418,11 @@ void RL_Sim::GetSysJoystick()
     if (this->sys_js_button[5].pressed && this->sys_js_axis[6] < 0) this->control.SetGamepad(Input::Gamepad::RB_DPadLeft);
     if (this->sys_js_button[4].pressed && this->sys_js_button[5].on_press) this->control.SetGamepad(Input::Gamepad::LB_RB);
 
+    // BPX Passive wins over other button combinations sampled in this callback.
+    if (this->robot_name == "bpx" && this->sys_js_button[4].pressed &&
+        this->sys_js_button[2].on_press)
+        this->control.SetGamepad(Input::Gamepad::LB_X);
+
     float ly = -float(this->sys_js_axis[1]) / float(this->sys_js_max_value);
     float lx = -float(this->sys_js_axis[0]) / float(this->sys_js_max_value);
     float rx = -float(this->sys_js_axis[3]) / float(this->sys_js_max_value);
@@ -390,50 +450,67 @@ void RL_Sim::GetSysJoystick()
  */
 void RL_Sim::RunModel()
 {
-    if (this->rl_init_done && simulation_running)
+    std::unique_lock<std::mutex> bpx_lock(this->bpx_state_mutex_, std::defer_lock);
+    if (this->robot_name == "bpx") bpx_lock.lock();
+    try
     {
-        this->episode_length_buf += 1;
-        // 构建 MDP (马尔可夫决策过程) 的状态向量 (Observation)
-        this->obs.ang_vel = this->robot_state.imu.gyroscope;
-        this->obs.commands = {this->control.x, this->control.y, this->control.yaw};
-        //not currently available for non-ros mujoco version
-        // if (this->control.navigation_mode)
-        // {
-        //     this->obs.commands = {(float)this->cmd_vel.linear.x, (float)this->cmd_vel.linear.y, (float)this->cmd_vel.angular.z};
-        // }
-        this->obs.base_quat = this->robot_state.imu.quaternion;
-        this->obs.dof_pos = this->robot_state.motor_state.q;
-        this->obs.dof_vel = this->robot_state.motor_state.dq;
-
-        this->obs.actions = this->Forward();
-        // 将无量纲的网络输出转换为具体的物理控制参数
-        this->ComputeOutput(this->obs.actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);
-
-        // 基于生产者-消费者模式，将推理结果推入线程安全的队列，供高频控制回路异步拉取
-        if (!this->output_dof_pos.empty())
+        if (this->rl_init_done && simulation_running)
         {
-            output_dof_pos_queue.push(this->output_dof_pos);
-        }
-        if (!this->output_dof_vel.empty())
-        {
-            output_dof_vel_queue.push(this->output_dof_vel);
-        }
-        if (!this->output_dof_tau.empty())
-        {
-            output_dof_tau_queue.push(this->output_dof_tau);
-        }
+            if (this->robot_name == "bpx") this->ClampBpxCommands();
+            this->episode_length_buf += 1;
+            // 构建 MDP (马尔可夫决策过程) 的状态向量 (Observation)
+            this->obs.ang_vel = this->robot_state.imu.gyroscope;
+            this->obs.commands = {this->control.x, this->control.y, this->control.yaw};
+            //not currently available for non-ros mujoco version
+            // if (this->control.navigation_mode)
+            // {
+            //     this->obs.commands = {(float)this->cmd_vel.linear.x, (float)this->cmd_vel.linear.y, (float)this->cmd_vel.angular.z};
+            // }
+            this->obs.base_quat = this->robot_state.imu.quaternion;
+            this->obs.dof_pos = this->robot_state.motor_state.q;
+            this->obs.dof_vel = this->robot_state.motor_state.dq;
 
-        // this->TorqueProtect(this->output_dof_tau);
-        // this->AttitudeProtect(this->robot_state.imu.quaternion, 75.0f, 75.0f);
+            this->obs.actions = this->Forward();
+            // 将无量纲的网络输出转换为具体的物理控制参数
+            this->ComputeOutput(this->obs.actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);
 
-#ifdef CSV_LOGGER
-        std::vector<float> tau_est(this->params.Get<int>("num_of_dofs"), 0.0f);
-        for (int i = 0; i < this->params.Get<int>("num_of_dofs"); ++i)
-        {
-            tau_est[i] = this->joint_efforts[this->params.Get<std::vector<std::string>>("joint_controller_names")[i]];
+            // 基于生产者-消费者模式，将推理结果推入线程安全的队列，供高频控制回路异步拉取
+            if (!this->output_dof_pos.empty())
+            {
+                output_dof_pos_queue.push(this->output_dof_pos);
+            }
+            if (!this->output_dof_vel.empty())
+            {
+                output_dof_vel_queue.push(this->output_dof_vel);
+            }
+            // BPX uses position/velocity queues and simulator-side PD. Its unused tau
+            // queue must not grow for the duration of the simulation.
+            if (this->robot_name != "bpx" && !this->output_dof_tau.empty())
+            {
+                output_dof_tau_queue.push(this->output_dof_tau);
+            }
+
+            // this->TorqueProtect(this->output_dof_tau);
+            // this->AttitudeProtect(this->robot_state.imu.quaternion, 75.0f, 75.0f);
+
+    #ifdef CSV_LOGGER
+            std::vector<float> tau_est(this->params.Get<int>("num_of_dofs"), 0.0f);
+            for (int i = 0; i < this->params.Get<int>("num_of_dofs"); ++i)
+            {
+                tau_est[i] = this->joint_efforts[this->params.Get<std::vector<std::string>>("joint_controller_names")[i]];
+            }
+            this->CSVLogger(this->output_dof_tau, tau_est, this->obs.dof_pos, this->output_dof_pos, this->obs.dof_vel);
+    #endif
         }
-        this->CSVLogger(this->output_dof_tau, tau_est, this->obs.dof_pos, this->output_dof_pos, this->obs.dof_vel);
-#endif
+    }
+    catch (const std::exception& error)
+    {
+        if (this->robot_name != "bpx") throw;
+        bpx_fsm::StopPolicyAndDrain(*this);
+        this->InitControl();
+        bpx_fsm::Damping(*this, &this->robot_state, &this->robot_command);
+        this->fsm.RequestStateChange("RLFSMStatePassive");
+        std::cerr << LOGGER::ERROR << "[BPX] Inference stopped: " << error.what() << std::endl;
     }
 }
 
@@ -454,6 +531,10 @@ std::vector<float> RL_Sim::Forward()
     }
 
     std::vector<float> clamped_obs = this->ComputeObservation();
+    if (this->robot_name == "bpx" && (clamped_obs.size() != 45 ||
+        !std::all_of(clamped_obs.begin(), clamped_obs.end(), [](float value) { return std::isfinite(value); })))
+        throw std::runtime_error("BPX actor requires 45 finite observations");
+
 
     std::vector<float> actions;
     if (this->params.Get<std::vector<int>>("observations_history").size() != 0)
@@ -466,6 +547,10 @@ std::vector<float> RL_Sim::Forward()
     {
         actions = this->model->forward({clamped_obs});
     }
+
+    if (this->robot_name == "bpx" && (actions.size() != 12 ||
+        !std::all_of(actions.begin(), actions.end(), [](float value) { return std::isfinite(value); })))
+        throw std::runtime_error("BPX actor requires 12 finite actions");
 
     if (!this->params.Get<std::vector<float>>("clip_actions_upper").empty() && !this->params.Get<std::vector<float>>("clip_actions_lower").empty())
     {
@@ -496,6 +581,105 @@ void RL_Sim::Plot()
     }
     // plt::legend();
     plt::pause(0.01);
+}
+
+
+void RL_Sim::PollKeyboard()
+{
+    std::unique_lock<std::mutex> bpx_lock(this->bpx_state_mutex_, std::defer_lock);
+    if (this->robot_name == "bpx")
+    {
+        bpx_lock.lock();
+        // The existing keyboard poll is nonblocking only on a foreground TTY.
+        if (!::isatty(STDIN_FILENO) || ::tcgetpgrp(STDIN_FILENO) != ::getpgrp()) return;
+    }
+    this->KeyboardInterface();
+}
+
+void RL_Sim::ClampBpxCommands()
+{
+    const auto limits = this->params.Get<std::vector<float>>("command_limits");
+    if (limits.size() != 3)
+        throw std::runtime_error("BPX command_limits requires three entries");
+    this->control.x = std::clamp(this->control.x, -limits[0], limits[0]);
+    this->control.y = std::clamp(this->control.y, -limits[1], limits[1]);
+    this->control.yaw = std::clamp(this->control.yaw, -limits[2], limits[2]);
+}
+
+void RL_Sim::ValidateBpxModel()
+{
+    if (!this->mj_model || !this->mj_data || this->mj_model->nu != 12 ||
+        this->mj_model->nq != 19 || this->mj_model->nv != 18 ||
+        this->params.Get<int>("num_of_dofs") != 12)
+        throw std::runtime_error("BPX expects a floating-base model with 12 motors");
+    const auto names = this->params.Get<std::vector<std::string>>("joint_names");
+    const auto mapping = this->params.Get<std::vector<int>>("joint_mapping");
+    const auto command_limits = this->params.Get<std::vector<float>>("command_limits");
+    if (names.size() != 12 || mapping.size() != 12 || command_limits.size() != 3)
+        throw std::runtime_error("BPX invalid joint/command configuration");
+    for (float limit : command_limits)
+        if (!std::isfinite(limit) || limit <= 0)
+            throw std::runtime_error("BPX invalid command limit");
+    std::vector<bool> used(12, false);
+    const auto require_sensor = [&](const std::string& name, int address, int dim, int type) {
+        const int id = mj_name2id(this->mj_model, mjOBJ_SENSOR, name.c_str());
+        if (id < 0 || this->mj_model->sensor_adr[id] != address ||
+            this->mj_model->sensor_dim[id] != dim || this->mj_model->sensor_type[id] != type)
+            throw std::runtime_error("BPX incompatible sensor layout: " + name);
+    };
+    for (int i = 0; i < 12; ++i)
+    {
+        const int index = mapping[i];
+        const int joint = mj_name2id(this->mj_model, mjOBJ_JOINT, names[i].c_str());
+        if (index < 0 || index >= 12 || used[index] || joint < 0 ||
+            this->mj_model->actuator_trntype[index] != mjTRN_JOINT ||
+            this->mj_model->actuator_trnid[2 * index] != joint)
+            throw std::runtime_error("BPX joint_mapping does not match its motors");
+        used[index] = true;
+        require_sensor(names[i] + "_pos", index, 1, mjSENS_JOINTPOS);
+        require_sensor(names[i] + "_vel", 12 + index, 1, mjSENS_JOINTVEL);
+        require_sensor(names[i] + "_tau", 24 + index, 1, mjSENS_JOINTACTFRC);
+        if (!this->mj_model->actuator_ctrllimited[index] ||
+            std::fabs(this->mj_model->actuator_ctrlrange[2 * index] + 30.0) > 1e-6 ||
+            std::fabs(this->mj_model->actuator_ctrlrange[2 * index + 1] - 30.0) > 1e-6 ||
+            std::fabs(this->mj_model->actuator_gear[6 * index] - 1.0) > 1e-6)
+            throw std::runtime_error("BPX expects torque motors limited to +/-30 Nm");
+    }
+    require_sensor("body_quat", 36, 4, mjSENS_FRAMEQUAT);
+    require_sensor("body_gyro", 40, 3, mjSENS_GYRO);
+    const double dt = this->params.Get<float>("dt");
+    if (!std::isfinite(dt) || std::fabs(dt - 0.005) > 1e-8 || this->params.Get<int>("decimation") != 4 ||
+        std::fabs(this->mj_model->opt.timestep - dt) > 1e-8)
+        throw std::runtime_error("BPX model timestep must match dt=0.005/decimation=4");
+    if (this->mj_model->opt.disableflags & mjDSBL_CLAMPCTRL)
+        throw std::runtime_error("BPX requires MuJoCo control clamping");
+    if (mj_name2id(this->mj_model, mjOBJ_KEY, "home") < 0)
+        throw std::runtime_error("BPX requires a home keyframe");
+}
+
+void RL_Sim::ResetBpxSimulation(bool reset_fsm)
+{
+    // Caller holds sim->mtx; runtime callers also hold bpx_state_mutex_.
+    const int home = mj_name2id(this->mj_model, mjOBJ_KEY, "home");
+    if (home < 0) throw std::runtime_error("BPX missing home keyframe");
+    bpx_fsm::StopPolicyAndDrain(*this);
+    mj_resetDataKeyframe(this->mj_model, this->mj_data, home);
+    mj_forward(this->mj_model, this->mj_data);
+    this->GetState(&this->robot_state);
+    this->InitControl();
+    this->obs.actions.assign(12, 0.0f);
+    this->episode_length_buf = 0;
+    this->control.current_keyboard = this->control.last_keyboard = Input::Keyboard::None;
+    this->control.current_gamepad = this->control.last_gamepad = Input::Gamepad::None;
+    if (reset_fsm)
+    {
+        const auto previous = this->fsm.current_state_;
+        if (previous) previous->Exit();
+        this->fsm.previous_state_ = previous;
+        this->fsm.SetInitialState("RLFSMStatePassive");
+        this->fsm.mode_ = FSM::Mode::NORMAL;
+    }
+    bpx_fsm::Damping(*this, &this->robot_state, &this->robot_command);
 }
 
 // Signal handler for Ctrl+C
