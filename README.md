@@ -53,7 +53,7 @@ ifconfig        # Find the network interface connected to the Unitree robot
 
 ![Real Unitree Go2 deployment](images/0781e5afe740479a3f4b394aced23544.gif)
 
-# BPX
+## BPX
 
 - MuJoCo Sim-to-Sim
 
@@ -69,6 +69,51 @@ ifconfig        # Find the network interface connected to the Unitree robot
 ./cmake_build/bin/rl_real_bpx --control 10.21.20.1
 ```
 
+![Real BPX deployment](images/4726c3bb5c4539193725a07381c2b332.gif)
+
+## Controls
+
+### Keyboard Controls
+
+| Key | Function | Activation Condition | MuJoCo | Real Go2 | Real BPX |
+|---|---|---|:---:|:---:|:---:|
+| `0` | Enter the `GetUp` state | Normally starts from Passive; can also stand up again from RL or GetDown | ✓ | ✓ | ✓ |
+| `1` | Enable the `RL Locomotion` policy | The get-up motion must be completed first | ✓ | ✓ | ✓ |
+| `9` | Enter the `GetDown` state | Available after standing up or while under RL control | ✓ | ✓ | ✓ |
+| `P` | Immediately request Passive damping mode | Available during GetUp, RL, and GetDown | ✓ | ✓ | ✓ |
+| `Ctrl+C` | Exit the program and perform cleanup | Available in any state | ✓ | ✓ | ✓ |
+
+| Key | Internal Change | Robot Motion |
+|---|---:|---|
+| `W` | `vx += 0.1` | Increase forward velocity |
+| `S` | `vx -= 0.1` | Decrease forward velocity or increase backward velocity |
+| `A` | `vy += 0.1` | Increase leftward lateral velocity |
+| `D` | `vy -= 0.1` | Increase rightward lateral velocity |
+| `Q` | `wz += 0.1` | Increase positive yaw rate, normally turning left |
+| `E` | `wz -= 0.1` | Increase negative yaw rate, normally turning right |
+| `Space` | `vx=vy=wz=0` | Clear all velocity commands and stop walking |
+
+### Unitree Go2 Controller
+
+The official Unitree Go2 controller is supported only when deploying to a real Unitree Go2. It has no effect in MuJoCo simulations or on a real BPX robot.
+
+| Unitree Controller Input | Function | Activation Condition and Description |
+|---|---|---|
+| `A` | Stand up and enter `GetUp` | Starts the get-up sequence from Passive, GetDown, or RL |
+| `R1 + D-pad Up` | Enable the reinforcement learning locomotion policy | Use only after the get-up motion has completed |
+| `B` | Lie down and enter `GetDown` | Available after standing up or during RL locomotion; automatically enters Passive when complete |
+| `L1 + X` | Enter Passive damping mode | Highest priority; clears all velocity commands and exits RL control |
+| `X` | Toggle navigation mode | In the default non-ROS build, this only toggles a flag and does not take control of velocity commands |
+
+| Controller Input | Control Variable | Effect |
+|---|---|---|
+| Left stick forward/backward | `vx` | Controls forward and backward motion |
+| Left stick left/right | `vy` | Controls lateral motion to the left and right |
+| Right stick left/right | `wz` | Controls left and right turns |
+| All sticks centered | Zero velocity | Stops walking while the robot remains standing under RL control |
+| `L1 + X` | Clear all velocity commands | Exits the policy and enters Passive damping mode |
+
+### Game Controller
 
 
 # Acknowledgments
