@@ -1,13 +1,16 @@
+# Copyright (c) 2026 Ercong Huang
+# SPDX-License-Identifier: Apache-2.0
+
 bpx:
   dt: 0.005
   decimation: 4
   num_of_dofs: 12
   wheel_indices: []
   fixed_kp: [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
-  fixed_kd: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+  fixed_kd: [2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3]
   passive_kd: 1.0
-  getup_duration: 2.0
-  getdown_duration: 1.0
+  getup_duration: 4.0
+  getdown_duration: 4.0
   command_limits: [1.5, 1.0, 2.0]
   torque_limits: [30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0]
   # Policy order: roll FL/FR/HL/HR, pitch FL/FR/HL/HR, knee FL/FR/HL/HR.
@@ -16,3 +19,19 @@ bpx:
                 fl_hip_pitch_joint, fr_hip_pitch_joint, hl_hip_pitch_joint, hr_hip_pitch_joint,
                 fl_knee_joint, fr_knee_joint, hl_knee_joint, hr_knee_joint]
   joint_mapping: [0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]
+
+  # BPX SDK adapter parameters. All joint arrays use policy order.
+  # q_policy = sign * (q_sdk[mapping] - offset); no model-range gate.
+  # SDK xyzw quaternion is converted to policy wxyz by the adapter.
+  # gyro_scale=1 requires SDK angular velocity in rad/s.
+  robot_state_port: 9873
+  joint_state_port: 7895
+  robot_state_rate_hz: 100
+  connect_timeout_ms: 10000
+  state_timeout_ms: 100
+  joint_sign: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  joint_offset: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  body_from_imu_quat_wxyz: [1, 0, 0, 0]
+  imu_omega_frame: imu
+  gyro_scale: 1.0
+  real_command_limits: [0.7, 0.7, 0.7]

@@ -9,8 +9,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(USE_CMAKE "Build without ROS" ON)
-option(USE_MUJOCO "Build Go2 MuJoCo executable" ON)
+option(USE_MUJOCO "Build Go2 and BPX MuJoCo executable" ON)
 option(BUILD_GO2_REAL "Build Go2 real executable" ON)
+option(BUILD_BPX_REAL "Build BPX real executable" OFF)
 option(USE_TORCH "Enable the TorchScript inference backend" ON)
 option(USE_ONNX "Enable the ONNX Runtime CPU inference backend" ON)
 
@@ -20,8 +21,8 @@ endif()
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "This deployment build targets Linux.")
 endif()
-if(NOT USE_MUJOCO AND NOT BUILD_GO2_REAL)
-    message(FATAL_ERROR "Enable at least one Go2 executable.")
+if(NOT USE_MUJOCO AND NOT BUILD_GO2_REAL AND NOT BUILD_BPX_REAL)
+    message(FATAL_ERROR "Enable at least one deployment executable: USE_MUJOCO, BUILD_GO2_REAL or BUILD_BPX_REAL.")
 endif()
 if(NOT USE_TORCH AND NOT USE_ONNX)
     message(FATAL_ERROR "Enable at least one inference backend: USE_TORCH or USE_ONNX.")
@@ -33,6 +34,32 @@ set(SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/library/thirdparty/robot_sdk/unitree/un
 set(LIBTORCH_DIR "${DEPLOY_ROOT}/library/inference_runtime/libtorch")
 set(ONNX_RUNTIME_DIR "${DEPLOY_ROOT}/library/inference_runtime/onnxruntime")
 set(MUJOCO_DIR "${DEPLOY_ROOT}/library/mujoco")
+set(BPX_SDK_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/library/thirdparty/robot_sdk/bpx/bpx_sdk_open"
+    CACHE PATH "BPX SDK repository containing include/ and lib/"
+)
+# Resolve an explicitly provided relative SDK path against this CMake source directory.
+get_filename_component(BPX_SDK_DIR "${BPX_SDK_DIR}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+
+if(BUILD_BPX_REAL)
+    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" BPX_SDK_ARCH)
+    if(BPX_SDK_ARCH MATCHES "^(x86_64|amd64|x64)$")
+        set(BPX_SDK_ARCH x86_64)
+    elseif(BPX_SDK_ARCH MATCHES "^(aarch64|arm64)$")
+        set(BPX_SDK_ARCH aarch64)
+    else()
+        message(FATAL_ERROR "BPX SDK supports Linux x86_64 and aarch64; got ${CMAKE_SYSTEM_PROCESSOR}.")
+    endif()
+    set(BPX_SDK_LIBRARY "${BPX_SDK_DIR}/lib/libbpx_sdk_${BPX_SDK_ARCH}.so")
+    foreach(bpx_sdk_header IN ITEMS joint_level_control.h request_robot_state.h motion_types.h)
+        if(NOT EXISTS "${BPX_SDK_DIR}/include/${bpx_sdk_header}")
+            message(FATAL_ERROR "BPX SDK header missing: ${BPX_SDK_DIR}/include/${bpx_sdk_header}")
+        endif()
+    endforeach()
+    if(NOT EXISTS "${BPX_SDK_LIBRARY}")
+        message(FATAL_ERROR "BPX SDK shared library missing: ${BPX_SDK_LIBRARY}")
+    endif()
+endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
@@ -109,6 +136,9 @@ endif()
 if(USE_MUJOCO)
     list(APPEND CMAKE_INSTALL_RPATH "${MUJOCO_DIR}/lib")
 endif()
+if(BUILD_BPX_REAL)
+    list(APPEND CMAKE_INSTALL_RPATH "${BPX_SDK_DIR}/lib")
+endif()
 list(REMOVE_DUPLICATES CMAKE_INSTALL_RPATH)
 add_link_options("-Wl,--disable-new-dtags")
 
@@ -166,6 +196,22 @@ if(BUILD_GO2_REAL)
     target_link_libraries(rl_real_go2 PRIVATE go2_core unitree_sdk2)
 endif()
 
+if(BUILD_BPX_REAL)
+    # Import only the SDK library; do not add its example/test targets to this project.
+    add_library(BPX::SDK SHARED IMPORTED GLOBAL)
+    set_target_properties(BPX::SDK PROPERTIES
+        IMPORTED_LOCATION "${BPX_SDK_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${BPX_SDK_DIR}/include"
+        INTERFACE_LINK_LIBRARIES Threads::Threads
+    )
+    add_executable(rl_real_bpx src/rl_real_bpx.cpp)
+    # Keep the real-robot selector private: shared core/MuJoCo/Go2 must not see it.
+    target_compile_definitions(rl_real_bpx PRIVATE USE_BPX_REAL)
+    target_link_libraries(rl_real_bpx PRIVATE go2_core BPX::SDK)
+    message(STATUS "BPX SDK architecture: ${BPX_SDK_ARCH}")
+    message(STATUS "BPX SDK library: ${BPX_SDK_LIBRARY}")
+endif()
+
 if(USE_MUJOCO)
     find_package(glfw3 REQUIRED)
     if(NOT EXISTS "${MUJOCO_DIR}/include/mujoco/mujoco.h" OR
@@ -198,6 +244,7 @@ endif()
 
 message(STATUS "Deployment root: ${DEPLOY_ROOT}")
 message(STATUS "Inference backends: USE_TORCH=${USE_TORCH}; USE_ONNX=${USE_ONNX}")
-message(STATUS "Policy configuration: ${DEPLOY_ROOT}/policy/go2/robot_lab/config.yaml (model_name selects backend)")
-message(STATUS "MuJoCo scenes: ${DEPLOY_ROOT}/src/robot_description/go2_description/mjcf")
-message(STATUS "USE_MUJOCO=${USE_MUJOCO}; BUILD_GO2_REAL=${BUILD_GO2_REAL}")
+message(STATUS "Go2 policy: ${DEPLOY_ROOT}/policy/go2/robot_lab/config.yaml (model_name selects backend)")
+message(STATUS "BPX policy: ${DEPLOY_ROOT}/policy/bpx/mirrorme/config.yaml; robot settings: ${DEPLOY_ROOT}/policy/bpx/base.yaml")
+message(STATUS "MuJoCo scenes: ${DEPLOY_ROOT}/src/robot_description/{go2,bpx}_description/mjcf")
+message(STATUS "USE_MUJOCO=${USE_MUJOCO}; BUILD_GO2_REAL=${BUILD_GO2_REAL}; BUILD_BPX_REAL=${BUILD_BPX_REAL}")

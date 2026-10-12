@@ -8,14 +8,13 @@
 
 #include "fsm.hpp"
 #include "rl_sdk.hpp"
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
-// BPX simulation reference. This is not a real-robot controller.
-// Scheduling requirement: the BPX RobotControl and RunModel callbacks must hold
-// the same entry-local mutex for their entire callbacks. A false rl_init_done
-// or the existing Forward-only model_mutex does not synchronize queue producers.
-// Go2 can retain its existing path; do not change its FSM or observation contract.
+// Shared BPX FSM for MuJoCo and the BPX real entry.
+// The real entry preloads the model and serializes FSM/inference/queue access.
 namespace bpx_fsm
 {
 inline void StopPolicyAndDrain(RL& rl)
@@ -27,22 +26,45 @@ inline void StopPolicyAndDrain(RL& rl)
     while (rl.output_dof_tau_queue.try_pop(discarded)) {}
 }
 
-inline std::vector<float> RequireVector(RL& rl, const char* key)
+inline void RequireJointVector(
+    const std::vector<float>& values,
+    const char* description)
 {
-    auto values = rl.params.Get<std::vector<float>>(key);
-    if (rl.params.Get<int>("num_of_dofs") != 12 || values.size() != 12)
-        throw std::runtime_error(std::string("BPX expects twelve entries in ") + key);
+    if (values.size() != 12)
+        throw std::runtime_error(std::string("BPX expects twelve entries in ") + description);
     for (float value : values)
         if (!std::isfinite(value))
-            throw std::runtime_error(std::string("BPX nonfinite value in ") + key);
+            throw std::runtime_error(std::string("BPX nonfinite value in ") + description);
+}
+
+inline std::vector<float> RequireVector(RL& rl, const char* key)
+{
+    if (rl.params.Get<int>("num_of_dofs") != 12)
+        throw std::runtime_error("BPX expects twelve joints");
+    auto values = rl.params.Get<std::vector<float>>(key);
+    RequireJointVector(values, key);
     return values;
+}
+
+inline void RequireFixedGains(RL& rl)
+{
+    const auto kp = RequireVector(rl, "fixed_kp");
+    const auto kd = RequireVector(rl, "fixed_kd");
+    for (size_t i = 0; i < 12; ++i)
+        if (kp[i] < 0.0f || kd[i] < 0.0f)
+            throw std::runtime_error("BPX negative fixed PD gain");
 }
 
 inline float Duration(RL& rl, const char* key, float fallback)
 {
     const float value = rl.params.Get<float>(key, fallback);
-    if (!std::isfinite(value) || value <= 0)
-        throw std::runtime_error(std::string("BPX invalid duration: ") + key);
+    const float dt = rl.params.Get<float>("dt");
+    const double frames = std::ceil(value / dt);
+    if (!std::isfinite(value) || value <= 0.0f ||
+        !std::isfinite(dt) || dt <= 0.0f ||
+        !std::isfinite(frames) || frames < 1.0 ||
+        frames > std::numeric_limits<int>::max())
+        throw std::runtime_error(std::string("BPX invalid interpolation duration or dt: ") + key);
     return value;
 }
 
@@ -58,8 +80,9 @@ inline void Damping(
     RobotCommand<float>* command)
 {
     const float kd = rl.params.Get<float>("passive_kd", 1.0f);
-    if (!std::isfinite(kd) || kd < 0 || rl.params.Get<int>("num_of_dofs") != 12)
+    if (!std::isfinite(kd) || kd < 0.0f || rl.params.Get<int>("num_of_dofs") != 12)
         throw std::runtime_error("BPX invalid Passive gain or joint count");
+    RequireJointVector(state->motor_state.q, "measured position");
     for (int i = 0; i < 12; ++i)
     {
         command->motor_command.q[i] = state->motor_state.q[i];
@@ -77,7 +100,7 @@ inline void SeedStandingCommand(RL& rl, RobotCommand<float>* command)
     const auto kd = RequireVector(rl, "rl_kd");
     for (int i = 0; i < 12; ++i)
     {
-        if (kp[i] < 0 || kd[i] < 0)
+        if (kp[i] < 0.0f || kd[i] < 0.0f)
             throw std::runtime_error("BPX negative policy PD gain");
         command->motor_command.q[i] = pose[i];
         command->motor_command.dq[i] = 0.0f;
@@ -98,7 +121,7 @@ public:
         StopPolicyAndDrain(rl);
         rl.InitControl();
         std::cout << LOGGER::NOTE
-                  << "[BPX] Passive; press 0/A for nominal stand."
+                  << "[BPX] Passive; press 0/A to stand from the current pose."
                   << std::endl;
     }
 
@@ -130,32 +153,43 @@ public:
         StopPolicyAndDrain(rl);
         rl.InitControl();
         percent_ = 0.0f;
-        start_ = fsm_state->motor_state.q;
+        RequireJointVector(fsm_state->motor_state.q, "GetUp measured position");
+        rl.now_state = *fsm_state;
+        start_ = rl.now_state.motor_state.q;
         target_ = RequireVector(rl, "default_dof_pos");
-        RequireVector(rl, "fixed_kp");
-        RequireVector(rl, "fixed_kd");
+        RequireFixedGains(rl);
         duration_ = Duration(rl, "getup_duration", 2.0f);
-        // Policy/group order: roll(FL,FR,HL,HR), pitch(...), knee(...).
-        // No Go2-specific tucked pre_running_pos is reused here.
+
+        // Keep the original resting pose through RL -> GetUp recovery.
+        // A new Passive -> GetUp transition begins a new standing cycle.
+        const bool from_passive =
+            rl.fsm.previous_state_ &&
+            rl.fsm.previous_state_->GetStateName() == "RLFSMStatePassive";
+        if (from_passive || !has_saved_start_)
+        {
+            rl.start_state = rl.now_state;
+            has_saved_start_ = true;
+        }
     }
 
     void Run() override
     {
-        Interpolate(
-            percent_,
-            start_,
-            target_,
-            duration_,
-            "[BPX] Nominal stand",
-            true);
+        // Use the same interpolation helper as Go2. In particular, a motion
+        // below its existing 0.1-rad threshold completes immediately.
+        Interpolate(percent_, start_, target_, duration_, "[BPX] Getting up", true);
     }
 
     void Exit() override {}
 
+    const std::vector<float>& StartPosition() const noexcept { return start_; }
+    bool HasSavedStart() const noexcept { return has_saved_start_; }
+    bool TrajectoryComplete() const noexcept { return percent_ >= 1.0f; }
+    float DurationSeconds() const noexcept { return duration_; }
+
     std::string CheckChange() override
     {
         if (WantsPassive(rl)) return "RLFSMStatePassive";
-        if (percent_ >= 1.0f)
+        if (TrajectoryComplete())
         {
             if (rl.control.current_keyboard == Input::Keyboard::Num1 ||
                 rl.control.current_gamepad == Input::Gamepad::RB_DPadUp)
@@ -168,8 +202,9 @@ public:
     }
 
 private:
+    bool has_saved_start_ = false;
     float percent_ = 0.0f;
-    float duration_ = 2.0f; // Deployment interpolation setting, not a training parameter.
+    float duration_ = 2.0f;
     std::vector<float> start_, target_;
 };
 
@@ -184,32 +219,33 @@ public:
         StopPolicyAndDrain(rl);
         rl.InitControl();
         percent_ = 0.0f;
-        start_ = fsm_state->motor_state.q;
-        target_ = RequireVector(rl, "default_dof_pos");
-        RequireVector(rl, "fixed_kp");
-        RequireVector(rl, "fixed_kd");
-        duration_ = Duration(rl, "getdown_duration", 1.0f);
-        std::cout << LOGGER::NOTE
-                  << "[BPX] Return to nominal stand, then Passive; no lying-down trajectory."
-                  << std::endl;
+        RequireJointVector(fsm_state->motor_state.q, "GetDown measured position");
+        const auto found = rl.fsm.states_.find("RLFSMStateGetUp");
+        const auto getup = found == rl.fsm.states_.end()
+            ? nullptr
+            : std::dynamic_pointer_cast<RLFSMStateGetUp>(found->second);
+        if (!getup || !getup->HasSavedStart())
+            throw std::runtime_error("BPX GetDown requires a captured resting position");
+        RequireJointVector(rl.start_state.motor_state.q, "saved resting position");
+        rl.now_state = *fsm_state;
+        start_ = rl.now_state.motor_state.q;
+        target_ = rl.start_state.motor_state.q;
+        RequireFixedGains(rl);
+        duration_ = Duration(rl, "getdown_duration", 2.0f);
     }
 
     void Run() override
     {
-        Interpolate(
-            percent_,
-            start_,
-            target_,
-            duration_,
-            "[BPX] Return to stand",
-            true);
+        Interpolate(percent_, start_, target_, duration_, "[BPX] Getting down", true);
     }
 
     void Exit() override {}
 
+    bool TrajectoryComplete() const noexcept { return percent_ >= 1.0f; }
+
     std::string CheckChange() override
     {
-        if (WantsPassive(rl) || percent_ >= 1.0f)
+        if (WantsPassive(rl) || TrajectoryComplete())
             return "RLFSMStatePassive";
         if (rl.control.current_keyboard == Input::Keyboard::Num0 ||
             rl.control.current_gamepad == Input::Gamepad::A)
@@ -219,7 +255,7 @@ public:
 
 private:
     float percent_ = 0.0f;
-    float duration_ = 1.0f;
+    float duration_ = 2.0f;
     std::vector<float> start_, target_;
 };
 
@@ -237,19 +273,27 @@ public:
         rl.episode_length_buf = 0;
         try
         {
-            // ReadYaml indexes the full path key, not only the last component.
+#ifdef USE_BPX_REAL
+            // The BPX real entry preloads and warms the model before its 5-ms
+            // worker starts, so RL entry does not perform disk loading.
+            if (!rl.model || !rl.model->is_loaded())
+                throw std::runtime_error("BPX real policy must be preloaded");
+            rl.InitObservations();
+            rl.InitOutputs();
+            rl.InitControl();
+#else
             const std::string profile = "bpx/mirrorme";
             const auto yaml = YAML::LoadFile(
                 std::string(POLICY_DIR) + "/" + profile + "/config.yaml");
             if (!yaml[profile] || !yaml[profile].IsMap())
                 throw std::runtime_error("Missing YAML mapping bpx/mirrorme");
-
             rl.InitRL(profile);
-
-            if (rl.params.Get<int>("num_observations") != 45 ||
+#endif
+            if (rl.params.Get<int>("num_of_dofs") != 12 ||
+                rl.params.Get<int>("num_observations") != 45 ||
                 !rl.params.Get<std::vector<int>>("observations_history").empty())
                 throw std::runtime_error(
-                    "BPX actor requires one 45-float frame without history");
+                    "BPX actor requires twelve joints and one 45-float frame without history");
 
             rl.obs.ang_vel = fsm_state->imu.gyroscope;
             rl.obs.base_quat = fsm_state->imu.quaternion;
@@ -259,7 +303,6 @@ public:
             rl.obs.commands = {0.0f, 0.0f, 0.0f};
             SeedStandingCommand(rl, fsm_command);
             loaded_ = true;
-            // rl_init_done is enabled by Run only after every setup step succeeds.
         }
         catch (const std::exception& error)
         {
@@ -281,10 +324,24 @@ public:
             rl.fsm.RequestStateChange("RLFSMStatePassive");
             return;
         }
-
         rl.rl_init_done = true;
-
-        // Same velocity display behavior as the current Go2 FSM.
+#ifdef USE_BPX_REAL
+        const char* limits_key = "real_command_limits";
+#else
+        const char* limits_key = "command_limits";
+#endif
+        const auto limits = rl.params.Get<std::vector<float>>(limits_key);
+        if (limits.size() != 3)
+            throw std::runtime_error("BPX expects three velocity command limits");
+        for (float limit : limits)
+            if (!std::isfinite(limit) || limit < 0.0f)
+                throw std::runtime_error("BPX invalid velocity command limit");
+        if (!std::isfinite(rl.control.x) || !std::isfinite(rl.control.y) ||
+            !std::isfinite(rl.control.yaw))
+            throw std::runtime_error("BPX nonfinite velocity command");
+        rl.control.x = std::clamp(rl.control.x, -limits[0], limits[0]);
+        rl.control.y = std::clamp(rl.control.y, -limits[1], limits[1]);
+        rl.control.yaw = std::clamp(rl.control.yaw, -limits[2], limits[2]);
         std::cout << "\r\033[K" << std::flush
                   << LOGGER::INFO
                   << "RL Controller [" << rl.config_name << "]"
@@ -292,9 +349,6 @@ public:
                   << " y:" << rl.control.y
                   << " yaw:" << rl.control.yaw
                   << std::flush;
-
-        // No new frame: retain the seeded stand or the previous policy command.
-        // Do not reset to default_dof_pos on every 200-Hz control heartbeat.
         RLControl();
     }
 
@@ -344,10 +398,7 @@ public:
         return nullptr;
     }
 
-    std::string GetType() const override
-    {
-        return "bpx";
-    }
+    std::string GetType() const override { return "bpx"; }
 
     std::vector<std::string> GetSupportedStates() const override
     {
@@ -359,10 +410,7 @@ public:
         };
     }
 
-    std::string GetInitialState() const override
-    {
-        return initial_state_;
-    }
+    std::string GetInitialState() const override { return initial_state_; }
 
 private:
     std::string initial_state_;

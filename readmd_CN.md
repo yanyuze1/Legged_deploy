@@ -50,8 +50,11 @@ ifconfig        # 查询unitree相关连接网口信息
 
 - Real BPX
 ```bash
+./cmake_build/bin/rl_real_bpx --control 10.21.20.1
 ```
 
+
 # 致谢
+- [mirrorme_rl_train](https://github.com/mirrormerobotics/mirrorme_rl_train)
 - [rl_sar](https://github.com/fan-ziqi/rl_sar/tree/main)
 - [robot_lab](https://github.com/fan-ziqi/robot_lab)
