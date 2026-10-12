@@ -1,7 +1,7 @@
 <h1 align="center">legged_deploy</h1>
 
 <p align="center">
-  <a href="readmd_CN.md">中文</a> | <a href="readmd.md">English</a>
+  <a href="readmd_CN.md">中文</a> | <a href="README.md">English</a>
 </p>
 
 This project provides MuJoCo simulation validation and real-robot deployment for quadruped reinforcement learning policies. Policies trained with [legged_rl](https://github.com/yanyuze1/legged_rl) or [robot_lab](https://github.com/fan-ziqi/robot_lab) can be tested on a Unitree Go2 in MuJoCo and then deployed to the real robot. The [mirrorme_rl_train](https://github.com/mirrormerobotics/mirrorme_rl_train) project can be used to train reinforcement learning policies for BPX.
