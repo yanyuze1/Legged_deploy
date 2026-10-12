@@ -28,9 +28,9 @@ bash build.sh mujoco   # MuJoCo simulation
 bash build.sh all      # Build both targets; this is also the default when no argument is given
 ```
 
-# Validation
+## Usage
 
-## Unitree Go2
+### Unitree Go2
 
 - MuJoCo Sim-to-Sim
 
@@ -53,7 +53,7 @@ ifconfig        # Find the network interface connected to the Unitree robot
 
 ![Real Unitree Go2 deployment](images/0781e5afe740479a3f4b394aced23544.gif)
 
-## BPX
+### BPX
 
 - MuJoCo Sim-to-Sim
 

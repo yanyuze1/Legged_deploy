@@ -22,8 +22,8 @@ bash build.sh real     # 真机部署，包含键盘速度控制
 bash build.sh mujoco   # MuJoCo 仿真
 bash build.sh all      # 同时编译；无参数也使用此模式
 ```
-# 验证
-## Unitree go2
+## 使用
+### Unitree go2
 - Mujoco 2sim
 
     在进行真机部署前推荐使用Mujoco进行2sim仿真验证确保训练策略在非训练环境下演示效果。
@@ -41,7 +41,7 @@ ifconfig        # 查询unitree相关连接网口信息
 ```
 ![alt text](images/0781e5afe740479a3f4b394aced23544.gif)
 
-## BPX
+### BPX
 - Mujoco 2sim
 ```bash
 ./cmake_build/bin/rl_sim_mujoco bpx scene
