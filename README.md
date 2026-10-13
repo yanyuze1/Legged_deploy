@@ -105,7 +105,6 @@ The official Unitree Go2 controller is supported only when deploying to a real U
 | Left stick left/right | `vy` | Controls lateral motion to the left and right |
 | Right stick left/right | `wz` | Controls left and right turns |
 | All sticks centered | Zero velocity | Stops walking while the robot remains standing under RL control |
-| `L1 + X` | Clear all velocity commands | Exits the policy and enters Passive damping mode |
 
 ### Game Controller
 
