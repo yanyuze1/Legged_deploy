@@ -27,6 +27,7 @@ RL_Real::RL_Real(int argc, char **argv)
     this->ang_vel_axis = "body";
     this->robot_name = "go2";
     this->ReadYaml(this->robot_name, "base.yaml");
+    this->SetupSysJoystick();
 
     // auto load FSM by robot_name
     if (FSMManager::GetInstance().IsTypeSupported(this->robot_name))
@@ -220,6 +221,19 @@ void RL_Real::ResetInputEvents()
     this->control.last_gamepad = Input::Gamepad::None;
 }
 
+void RL_Real::SetupSysJoystick()
+{
+    // Use the same device, precision and mapping as the validated MuJoCo path.
+    const std::string device = "/dev/input/js0";
+    if (this->sys_gamepad_.Setup(device, 16))
+        std::cout << LOGGER::INFO << "[Joystick] Opened " << device
+                  << "; center sticks and release buttons before use" << std::endl;
+    else
+        std::cout << LOGGER::NOTE << "Joystick [" << device
+                  << "] open failed; official remote and keyboard remain available"
+                  << std::endl;
+}
+
 void RL_Real::MapGamepad()
 {
     if (this->unitree_joy.components.A) this->control.SetGamepad(Input::Gamepad::A);
@@ -325,8 +339,6 @@ void RL_Real::SetCommand(const RobotCommand<float> *command)
 void RL_Real::RobotControl()
 {
     this->ResetInputEvents();
-    // kbhit uses terminal VMIN=0, not O_NONBLOCK on a pipe. Only poll a foreground
-    // TTY here: a blocking pipe/background terminal must not stall robot control.
     if (::isatty(STDIN_FILENO) && ::tcgetpgrp(STDIN_FILENO) == ::getpgrp())
         this->KeyboardInterface();
     const auto keyboard = this->control.current_keyboard;
@@ -334,39 +346,49 @@ void RL_Real::RobotControl()
     this->GetState(&this->robot_state);
 
     const auto now = go2_teleop::Clock::now();
+    const bool local_was_connected = this->sys_gamepad_.Snapshot().connected;
+    this->sys_gamepad_.Poll(now);
+    auto local = this->sys_gamepad_.Snapshot();
+    if (local_was_connected && !local.connected)
+        std::cout << std::endl << LOGGER::NOTE
+                  << "[PC gamepad] Disconnected; local velocity cleared. Reconnect and restart to reopen."
+                  << std::endl;
     const go2_teleop::RemoteSample remote{this->joystick.ly(), this->joystick.lx(),
         this->joystick.rx(), this->joystick_received_, this->joystick_time_};
     const bool remote_fresh = go2_teleop::SimpleVelocityInput::IsFresh(remote, now);
+    const bool remote_finite = std::isfinite(remote.ly) && std::isfinite(remote.lx) &&
+                               std::isfinite(remote.rx);
+    const bool remote_active = remote_fresh && remote_finite &&
+        (std::fabs(remote.ly) >= go2_teleop::SimpleVelocityInput::Deadzone ||
+         std::fabs(remote.lx) >= go2_teleop::SimpleVelocityInput::Deadzone ||
+         std::fabs(remote.rx) >= go2_teleop::SimpleVelocityInput::Deadzone);
+    const bool remote_lost = this->official_was_fresh_ && !remote_fresh;
+    this->official_was_fresh_ = remote_fresh;
+    const bool official_has_control = remote_fresh &&
+        (remote_active || this->joystick.keys() != 0);
     if (remote_fresh) this->MapGamepad();
-
-    // Detect L1+X directly: other simultaneously held buttons must not overwrite
-    // the original sequential mapping's Passive combination.
-    const bool passive_requested = keyboard == Input::Keyboard::P ||
-        (remote_fresh && this->unitree_joy.components.L1 && this->unitree_joy.components.X);
-    const bool movement_key = keyboard == Input::Keyboard::W || keyboard == Input::Keyboard::S ||
-        keyboard == Input::Keyboard::A || keyboard == Input::Keyboard::D ||
-        keyboard == Input::Keyboard::Q || keyboard == Input::Keyboard::E ||
-        keyboard == Input::Keyboard::Space;
-    const bool keyboard_mode_key = keyboard == Input::Keyboard::Num0 ||
-        keyboard == Input::Keyboard::Num1 || keyboard == Input::Keyboard::Num9 ||
-        keyboard == Input::Keyboard::P || keyboard == Input::Keyboard::N;
-    const auto gamepad = this->control.current_gamepad;
-    const bool gamepad_mode_key = gamepad == Input::Gamepad::A || gamepad == Input::Gamepad::B ||
-        gamepad == Input::Gamepad::RB_DPadUp || gamepad == Input::Gamepad::LB_X ||
-        gamepad == Input::Gamepad::X;
-
-    // Official FSM mode requests win over conflicting keyboard mode requests.
-    // Movement keys never reach the shared +/-0.1 generator a second time.
-    if (!movement_key && !(gamepad_mode_key && keyboard_mode_key))
-        this->control.current_keyboard = keyboard;
-
-    if (passive_requested)
+    const auto official_event = this->control.current_gamepad;
+    // Stop requests from any source are handled before ordinary mode arbitration.
+    const bool official_passive = remote_fresh && this->unitree_joy.components.L1 &&
+                                  this->unitree_joy.components.X;
+    // Preserve local Passive even when ordinary local input is suppressed.
+    const bool local_passive = local.passive;
+    if (official_has_control || remote_lost || (remote_fresh && !remote_finite))
+    {
+        this->sys_gamepad_.RequireNeutral();
+        local = this->sys_gamepad_.Snapshot();
+    }
+    local.passive = local_passive;
+    const auto decision = go2_teleop::DecideMode(
+        keyboard, official_event, official_has_control, official_passive, local);
+    bool passive_requested = decision.passive;
+    this->control.current_keyboard = decision.keyboard;
+    this->control.current_gamepad = decision.gamepad;
+    const auto request_passive = [this]()
     {
         this->control.current_keyboard = Input::Keyboard::P;
         this->control.current_gamepad = Input::Gamepad::LB_X;
         this->velocity_input_.ClearKeyboard();
-        // RequestStateChange(Passive) ignores same-current requests; explicitly
-        // cancel a pending Passive -> GetUp transition before the FSM heartbeat.
         if (this->fsm.current_state_ &&
             this->fsm.current_state_->GetStateName() == "RLFSMStatePassive")
         {
@@ -375,21 +397,49 @@ void RL_Real::RobotControl()
         }
         else
             this->fsm.RequestStateChange("RLFSMStatePassive");
+    };
+    if (passive_requested) request_passive();
+    bool clear_input = decision.clear_velocity;
+    if (clear_input)
+    {
+        this->control.x = this->control.y = this->control.yaw = 0.0f;
+        std::lock_guard<std::mutex> lock(this->velocity_mutex_);
+        this->published_velocity_ = {};
     }
-
     const auto previous_state = this->fsm.current_state_;
     this->StateController(&this->robot_state, &this->robot_command);
     const bool changed_state = previous_state != this->fsm.current_state_;
-    // FSM Enter may synchronously load a model. Re-evaluate the DDS input age
-    // afterwards; the snapshot taken before that work may now be stale.
-    auto velocity = this->velocity_input_.Update(keyboard, remote, go2_teleop::Clock::now(),
-        keyboard_mode_key || gamepad_mode_key || changed_state || passive_requested);
-
+    // Normal frames poll once so mode edges are consumed by the next heartbeat.
+    // A long model load needs a fresh state snapshot; ordinary events from that
+    // gap are discarded by Reader's RequireNeutral, while Passive is retained.
+    const auto after_fsm = go2_teleop::Clock::now();
+    if (after_fsm - now > std::chrono::milliseconds(100))
+    {
+        const bool was_connected = this->sys_gamepad_.Snapshot().connected;
+        this->sys_gamepad_.Poll(after_fsm);
+        local = this->sys_gamepad_.Snapshot();
+        if (was_connected && !local.connected)
+            std::cout << std::endl << LOGGER::NOTE
+                      << "[PC gamepad] Disconnected during model load; local velocity cleared."
+                      << std::endl;
+        if (local.passive && !passive_requested)
+        {
+            passive_requested = true;
+            clear_input = true;
+            request_passive();
+            this->rl_init_done = false;
+        }
+    }
+    if (clear_input || changed_state || official_has_control || remote_lost ||
+        (remote_fresh && !remote_finite) || keyboard == Input::Keyboard::Space)
+        this->sys_gamepad_.RequireNeutral();
+    local = this->sys_gamepad_.Snapshot();
+    auto velocity = this->velocity_input_.Update(keyboard, remote, local, go2_teleop::Clock::now(),
+        clear_input || changed_state, official_has_control);
     if (passive_requested)
     {
         velocity = {};
-        // Ensure this heartbeat sends Passive even if an FSM Enter schedules
-        // another transition. This is software damping, not a hardware E-stop.
+        // Software damping, including cancellation of a pending GetUp.
         for (int i = 0; i < this->params.Get<int>("num_of_dofs"); ++i)
         {
             this->robot_command.motor_command.dq[i] = 0;
@@ -402,7 +452,6 @@ void RL_Real::RobotControl()
     this->control.y = velocity.y;
     this->control.yaw = velocity.yaw;
     {
-        // Do not hold this lock over FSM Enter/InitRL, inference or DDS writes.
         std::lock_guard<std::mutex> lock(this->velocity_mutex_);
         this->published_velocity_ = velocity;
     }

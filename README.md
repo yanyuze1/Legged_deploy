@@ -75,16 +75,13 @@ ifconfig        # Find the network interface connected to the Unitree robot
 
 ### Keyboard Controls
 
-| Key | Function | Activation Condition | MuJoCo | Real Go2 | Real BPX |
-|---|---|---|:---:|:---:|:---:|
-| `0` | Enter the `GetUp` state | Normally starts from Passive; can also stand up again from RL or GetDown | ✓ | ✓ | ✓ |
-| `1` | Enable the `RL Locomotion` policy | The get-up motion must be completed first | ✓ | ✓ | ✓ |
-| `9` | Enter the `GetDown` state | Available after standing up or while under RL control | ✓ | ✓ | ✓ |
-| `P` | Immediately request Passive damping mode | Available during GetUp, RL, and GetDown | ✓ | ✓ | ✓ |
-| `Ctrl+C` | Exit the program and perform cleanup | Available in any state | ✓ | ✓ | ✓ |
-
-| Key | Internal Change | Robot Motion |
-|---|---:|---|
+| Key | Function | Activation Condition |
+|---|---|---|
+| `0` | Enter the `GetUp` state | Normally starts from Passive; can also stand up again from RL or GetDown |
+| `1` | Enable the `RL Locomotion` policy | The get-up motion must be completed first |
+| `9` | Enter the `GetDown` state | Available after standing up or while under RL control |
+| `P` | Immediately request Passive damping mode | Available during GetUp, RL, and GetDown |
+| `Ctrl+C` | Exit the program and perform cleanup | Available in any state |
 | `W` | `vx += 0.1` | Increase forward velocity |
 | `S` | `vx -= 0.1` | Decrease forward velocity or increase backward velocity |
 | `A` | `vy += 0.1` | Increase leftward lateral velocity |
@@ -104,9 +101,6 @@ The official Unitree Go2 controller is supported only when deploying to a real U
 | `B` | Lie down and enter `GetDown` | Available after standing up or during RL locomotion; automatically enters Passive when complete |
 | `L1 + X` | Enter Passive damping mode | Highest priority; clears all velocity commands and exits RL control |
 | `X` | Toggle navigation mode | In the default non-ROS build, this only toggles a flag and does not take control of velocity commands |
-
-| Controller Input | Control Variable | Effect |
-|---|---|---|
 | Left stick forward/backward | `vx` | Controls forward and backward motion |
 | Left stick left/right | `vy` | Controls lateral motion to the left and right |
 | Right stick left/right | `wz` | Controls left and right turns |
@@ -115,6 +109,19 @@ The official Unitree Go2 controller is supported only when deploying to a real U
 
 ### Game Controller
 
+| Controller Input | Function | Effect |
+|---|---|---|
+| `A` | Stand up and enter `GetUp` | |
+| `RB + D-pad Up` | Enable the RL locomotion policy | |
+| `B` | Lie down and enter `GetDown` | |
+| `LB + X` | Enter Passive damping mode | |
+| Left stick forward | Positive `vx` | Move forward |
+| Left stick backward | Negative `vx` | Move backward |
+| Left stick left | Positive `vy` | Move laterally to the left |
+| Left stick right | Negative `vy` | Move laterally to the right |
+| Right stick left | Positive `wz` | Turn left |
+| Right stick right | Negative `wz` | Turn right |
+| Sticks centered | Zero velocity | Stop moving while remaining standing |
 
 # Acknowledgments
 

@@ -192,7 +192,13 @@ if(BUILD_GO2_REAL)
     endif()
     set(BUILD_EXAMPLES OFF CACHE BOOL "Disable Unitree examples" FORCE)
     add_subdirectory("${SDK_DIR}" unitree_sdk2_build)
-    add_executable(rl_real_go2 src/rl_real_go2.cpp)
+    add_executable(rl_real_go2
+        src/rl_real_go2.cpp
+        library/thirdparty/joystick/joystick.cc
+    )
+    target_include_directories(rl_real_go2 PRIVATE
+        library/thirdparty/joystick
+    )
     target_link_libraries(rl_real_go2 PRIVATE go2_core unitree_sdk2)
 endif()
 
@@ -204,7 +210,13 @@ if(BUILD_BPX_REAL)
         INTERFACE_INCLUDE_DIRECTORIES "${BPX_SDK_DIR}/include"
         INTERFACE_LINK_LIBRARIES Threads::Threads
     )
-    add_executable(rl_real_bpx src/rl_real_bpx.cpp)
+    add_executable(rl_real_bpx
+        src/rl_real_bpx.cpp
+        library/thirdparty/joystick/joystick.cc
+    )
+    target_include_directories(rl_real_bpx PRIVATE
+        library/thirdparty/joystick
+    )
     # Keep the real-robot selector private: shared core/MuJoCo/Go2 must not see it.
     target_compile_definitions(rl_real_bpx PRIVATE USE_BPX_REAL)
     target_link_libraries(rl_real_bpx PRIVATE go2_core BPX::SDK)

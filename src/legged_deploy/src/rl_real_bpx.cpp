@@ -303,6 +303,7 @@ RL_Real_Bpx::RL_Real_Bpx(const char* robot_ip)
         PreloadPolicy(); // disk loading and first inference precede control ownership
         if (shutdown_requested) throw std::runtime_error("Startup interrupted");
         SetupTerminal();
+        SetupSysJoystick();
         ConnectAndWait(robot_ip);
         for (auto& pair : fsm.states_)
         {
@@ -315,7 +316,8 @@ RL_Real_Bpx::RL_Real_Bpx(const char* robot_ip)
         SetCommand(&robot_command);
         std::cout << LOGGER::INFO
                   << "BPX real ready: 0 stand, 1 policy, 9 return to startup pose, P passive; "
-                     "W/S A/D Q/E velocity, Space zero, Ctrl+C exit." << std::endl;
+                     "W/S A/D Q/E velocity, Space zero; gamepad A stand, RB+Up policy, "
+                     "B down, LB+X passive, sticks velocity; Ctrl+C exit." << std::endl;
         StartLoop();
     }
     catch (...)
@@ -368,6 +370,7 @@ void RL_Real_Bpx::LoadConfiguration()
     velocity_limits_ = ReadArray<3>(base_config_, "real_command_limits");
     for (float limit : velocity_limits_)
         if (limit <= 0.0f) throw std::runtime_error("Invalid operator command limit");
+    velocity_input_.Configure(velocity_limits_);
     body_from_imu_ = Normalize(ReadArray<4>(base_config_, "body_from_imu_quat_wxyz"));
     gyro_scale_ = Positive(base_config_, "gyro_scale");
     const std::string omega_frame = base_config_["imu_omega_frame"].as<std::string>();
@@ -584,6 +587,18 @@ void RL_Real_Bpx::ResetInputEvents()
 
 void RL_Real_Bpx::ForcePassive()
 {
+    if (fsm.current_state_ && fsm.current_state_->GetStateName() == "RLFSMStatePassive")
+    {
+        // A held LB+X must cancel pending GetUp without re-entering Passive
+        // and printing its Enter message on every 5-ms heartbeat.
+        fsm.next_state_ = fsm.current_state_;
+        fsm.mode_ = FSM::Mode::NORMAL;
+        bpx_fsm::StopPolicyAndDrain(*this);
+        InitControl();
+        bpx_fsm::Damping(*this, &robot_state, &robot_command);
+        policy_phase_ = 0;
+        return;
+    }
     if (fsm.current_state_) fsm.current_state_->Exit();
     fsm.previous_state_ = fsm.current_state_;
     fsm.mode_ = FSM::Mode::NORMAL;
@@ -592,20 +607,54 @@ void RL_Real_Bpx::ForcePassive()
     policy_phase_ = 0;
 }
 
+void RL_Real_Bpx::SetupSysJoystick()
+{
+    const std::string device = "/dev/input/js0";
+    if (sys_gamepad_.Setup(device, 16))
+        std::cout << LOGGER::INFO << "[BPX joystick] Opened " << device
+                  << "; center sticks and release buttons before use" << std::endl;
+    else
+        std::cout << LOGGER::NOTE << "Joystick [" << device
+                  << "] open failed; BPX keyboard remains available" << std::endl;
+}
+
 void RL_Real_Bpx::RobotControl()
 {
     GetState(&robot_state);
     ResetInputEvents();
     PollKeyboard();
     const auto key = control.current_keyboard;
-    // Passive has priority over a pending state transition.
-    if (key == Input::Keyboard::P) ForcePassive();
+    ResetInputEvents();
+    const bool was_connected = sys_gamepad_.Snapshot().connected;
+    sys_gamepad_.Poll(Clock::now()); // shared MuJoCo decoder, internally 10-ms reads
+    auto local = sys_gamepad_.Snapshot();
+    if (was_connected && !local.connected)
+        std::cout << std::endl << LOGGER::NOTE
+                  << "[BPX joystick] Disconnected; local velocity cleared. Reconnect and restart to reopen."
+                  << std::endl;
+    const auto decision = bpx_teleop::DecideMode(key, local);
+    control.current_keyboard = decision.keyboard;
+    control.current_gamepad = decision.gamepad;
+    const auto previous_state = fsm.current_state_;
+    if (decision.passive) ForcePassive();
     else StateController(&robot_state, &robot_command);
-    // The shared controller increments keyboard velocity after the FSM tick.
+    const bool changed_state = previous_state != fsm.current_state_;
+    // Preserve the mode event above before clearing local readiness for speed.
+    // Do not continuously disarm the gamepad in Passive/GetUp: that blocks A.
+    if (decision.clear_velocity || changed_state || key == Input::Keyboard::Space)
+        sys_gamepad_.RequireNeutral();
+    local = sys_gamepad_.Snapshot(); // state only: no second poll/edge consumption
+    const bool policy_active = PolicyActive();
+    const auto velocity = velocity_input_.Update(
+        key, local, decision.clear_velocity || changed_state || !policy_active);
+    control.x = velocity.x;
+    control.y = velocity.y;
+    control.yaw = velocity.yaw;
+    // Keep the original entry's last-stage limits before policy inference.
     control.x = std::clamp(control.x, -velocity_limits_[0], velocity_limits_[0]);
     control.y = std::clamp(control.y, -velocity_limits_[1], velocity_limits_[1]);
     control.yaw = std::clamp(control.yaw, -velocity_limits_[2], velocity_limits_[2]);
-    if (PolicyActive())
+    if (policy_active)
     {
         if (policy_phase_ == 0) RunModel();
         policy_phase_ = (policy_phase_ + 1) % decimation_;
@@ -613,13 +662,12 @@ void RL_Real_Bpx::RobotControl()
     else
     {
         bpx_fsm::StopPolicyAndDrain(*this);
-        // Velocity commands outside RL never carry into the next RL session.
         InitControl();
         policy_phase_ = 0;
     }
     ResetInputEvents();
     if (shutdown_requested) return;
-    GetState(&robot_state); // refresh feedback after inference and before sending
+    GetState(&robot_state);
     SetCommand(&robot_command);
 }
 
